@@ -8,6 +8,7 @@
 //!     ordered trees, persisted counters) from that schema.
 //!   - `codec`: the application-neutral byte-codec toolkit (`FixedString`, `CompositeKey`,
 //!     `encodeU64`/`decodeU64`, `Serializable`, `hash`).
+//!   - `wire_codec`: generic `@typeInfo`-driven struct/field marshalling for record encoding.
 //!   - `OrderedTree`: the ordered map an index is built on (point ops + range scans).
 //!
 //! The networked half of the surface attaches to this same barrel as it lands: the
@@ -18,6 +19,7 @@
 const engine = @import("engine.zig");
 
 pub const codec = @import("codec.zig");
+pub const wire_codec = @import("wire_codec.zig");
 
 pub const schema = engine.schema;
 pub const Schema = engine.Schema;
@@ -29,4 +31,5 @@ pub const OrderedTree = engine.OrderedTree;
 test {
     _ = @import("codec.zig");
     _ = @import("engine.zig");
+    _ = @import("wire_codec.zig");
 }
