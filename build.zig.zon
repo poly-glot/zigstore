@@ -1,0 +1,15 @@
+.{
+    .name = .zigstore,
+    .version = "0.0.0-dev",
+    .fingerprint = 0x6a18cb8f8f46ee2e,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+        "LICENSE",
+    },
+}

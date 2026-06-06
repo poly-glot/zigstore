@@ -1,0 +1,44 @@
+{
+  "name": "zigstore Dev",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "remoteUser": "vscode",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "installOhMyZsh": true,
+      "configureZshAsDefaultShell": true,
+      "username": "vscode"
+    },
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {},
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ziglang.vscode-zig",
+        "streetsidesoftware.code-spell-checker",
+        "eamodio.gitlens",
+        "timonwong.shellcheck"
+      ],
+      "settings": {
+        "zig.path": "/usr/local/bin/zig",
+        "zig.zls.path": "/usr/local/bin/zls",
+        "editor.formatOnSave": true,
+        "[zig]": {
+          "editor.defaultFormatter": "ziglang.vscode-zig"
+        }
+      }
+    }
+  },
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+  },
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached"
+  ],
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  test:
+    name: zig build test (0.15.2)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            | sudo tar -xJ -C /usr/local
+          echo "/usr/local/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
+
+      - name: Format check
+        run: zig fmt --check src/ examples/ build.zig
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Baseline build (Ampere/OKE target)
+        run: zig build -Dcpu=baseline --summary all
