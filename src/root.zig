@@ -32,4 +32,24 @@ test {
     _ = @import("codec.zig");
     _ = @import("engine.zig");
     _ = @import("wire_codec.zig");
+
+    _ = @import("page.zig");
+    _ = @import("page_cache.zig");
+    _ = @import("freelist.zig");
+    _ = @import("memtable.zig");
+    _ = @import("bloom.zig");
+    _ = @import("inverted_index.zig");
+    _ = @import("histogram.zig");
+    _ = @import("connection.zig");
+    _ = @import("signal.zig");
+
+    _ = @import("wal.zig");
+    _ = @import("wal_replay.zig");
+
+    _ = @import("btree/btree.zig");
+    _ = @import("btree/btree_insert.zig");
+    _ = @import("btree/btree_delete.zig");
+    _ = @import("btree/btree_search.zig");
+    _ = @import("btree/btree_repair.zig");
+    _ = @import("btree/btree_helpers.zig");
 }
