@@ -57,6 +57,11 @@ pub fn FixedString(comptime N: usize) type {
 
         const Self = @This();
 
+        /// Marker + capacity so a consumer (e.g. TS codegen) can detect a
+        /// FixedString by decl instead of matching the {data,len} field shape.
+        pub const is_fixed_string = true;
+        pub const capacity = N;
+
         /// Build a `FixedString` from a slice, truncating to the `N`-byte capacity.
         pub fn fromSlice(s: []const u8) Self {
             var fs = Self{};

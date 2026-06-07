@@ -25,37 +25,38 @@ pub const ServerConfig = struct {
 
     const MAX_TRUSTED_IPS = 16;
 
-    /// Build a config from the engine-neutral environment, falling back to the
-    /// struct defaults on absent or unparseable values. A zero thread count is
-    /// resolved to the host CPU count, capped at 32.
-    pub fn fromEnv() ServerConfig {
+    /// Build a config from the environment, reading keys under `prefix` (e.g.
+    /// `"ZIGSTORE_"` reads `ZIGSTORE_PORT`). Falls back to the struct defaults
+    /// on absent or unparseable values; a zero thread count resolves to the
+    /// host CPU count, capped at 32.
+    pub fn fromEnv(comptime prefix: []const u8) ServerConfig {
         var config = ServerConfig{};
-        if (std.posix.getenv("ZIGSTORE_PORT")) |v| {
+        if (std.posix.getenv(prefix ++ "PORT")) |v| {
             config.port = std.fmt.parseInt(u16, v, 10) catch 8080;
         }
-        if (std.posix.getenv("ZIGSTORE_CACHE_SIZE_MB")) |v| {
+        if (std.posix.getenv(prefix ++ "CACHE_SIZE_MB")) |v| {
             config.cache_size_mb = std.fmt.parseInt(u32, v, 10) catch 256;
         }
-        if (std.posix.getenv("ZIGSTORE_THREAD_COUNT")) |v| {
+        if (std.posix.getenv(prefix ++ "THREAD_COUNT")) |v| {
             config.thread_count = std.fmt.parseInt(u32, v, 10) catch 0;
         }
         if (config.thread_count == 0) {
             const max_threads: u32 = 32;
             config.thread_count = @intCast(@min(std.Thread.getCpuCount() catch 8, max_threads));
         }
-        if (std.posix.getenv("ZIGSTORE_SNAPSHOT_INTERVAL_S")) |v| {
+        if (std.posix.getenv(prefix ++ "SNAPSHOT_INTERVAL_S")) |v| {
             config.snapshot_interval_s = std.fmt.parseInt(u32, v, 10) catch 300;
         }
-        if (std.posix.getenv("ZIGSTORE_WAL_SYNC_INTERVAL_MS")) |v| {
+        if (std.posix.getenv(prefix ++ "WAL_SYNC_INTERVAL_MS")) |v| {
             config.wal_sync_interval_ms = std.fmt.parseInt(u32, v, 10) catch 50;
         }
-        if (std.posix.getenv("ZIGSTORE_WAL_BATCH_SIZE")) |v| {
+        if (std.posix.getenv(prefix ++ "WAL_BATCH_SIZE")) |v| {
             config.wal_batch_size = std.fmt.parseInt(u32, v, 10) catch 256;
         }
-        if (std.posix.getenv("ZIGSTORE_BIND")) |v| {
+        if (std.posix.getenv(prefix ++ "BIND")) |v| {
             config.bind_address = parseIpv4(v) orelse .{ 127, 0, 0, 1 };
         }
-        if (std.posix.getenv("ZIGSTORE_TRUSTED")) |v| {
+        if (std.posix.getenv(prefix ++ "TRUSTED")) |v| {
             config.parseTrustedIps(v);
         }
         return config;
@@ -75,25 +76,25 @@ pub const ServerConfig = struct {
 
             if (std.mem.indexOfScalar(u8, token, '/') != null) {
                 if (cidr_count >= MAX_TRUSTED_IPS) {
-                    log.warn("ZIGSTORE_TRUSTED: dropping CIDR '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
+                    log.warn("trusted-ip list: dropping CIDR '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
                     continue;
                 }
                 if (parseCidr(token)) |cidr| {
                     self.trusted_cidrs[cidr_count] = cidr;
                     cidr_count += 1;
                 } else {
-                    log.warn("ZIGSTORE_TRUSTED: ignoring unparseable CIDR token '{s}'", .{token});
+                    log.warn("trusted-ip list: ignoring unparseable CIDR token '{s}'", .{token});
                 }
             } else {
                 if (ip_count >= MAX_TRUSTED_IPS) {
-                    log.warn("ZIGSTORE_TRUSTED: dropping '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
+                    log.warn("trusted-ip list: dropping '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
                     continue;
                 }
                 if (parseIpv4(token)) |ip| {
                     self.trusted_ips[ip_count] = ip;
                     ip_count += 1;
                 } else {
-                    log.warn("ZIGSTORE_TRUSTED: ignoring unparseable IPv4 token '{s}'", .{token});
+                    log.warn("trusted-ip list: ignoring unparseable IPv4 token '{s}'", .{token});
                 }
             }
         }
