@@ -5,9 +5,11 @@ const MAX_REPLAY_DATA_LEN: usize = 16 * 1024 * 1024;
 
 const BLOCK_SIZE: usize = 4096;
 
+const test_op: u8 = 100;
+
 pub const ReplayEntry = struct {
     sequence: u64,
-    op_code: wal.OpCode,
+    op_code: u8,
     data: []const u8,
 };
 
@@ -69,13 +71,9 @@ pub const WalReader = struct {
                 return null;
             }
 
-            const op_code: wal.OpCode = std.meta.intToEnum(wal.OpCode, header_aligned.op_code) catch {
-                return null;
-            };
-
             const entry = ReplayEntry{
                 .sequence = header_aligned.sequence,
-                .op_code = op_code,
+                .op_code = header_aligned.op_code,
                 .data = data,
             };
 
@@ -166,9 +164,9 @@ test "write and read back WAL entries" {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
 
-        _ = try writer.append(.changeset, "category-one");
-        _ = try writer.append(.changeset, "link-data-here");
-        _ = try writer.append(.changeset, "updated-category");
+        _ = try writer.append(test_op, "category-one");
+        _ = try writer.append(test_op, "link-data-here");
+        _ = try writer.append(test_op, "updated-category");
         try writer.sync();
     }
 
@@ -178,17 +176,17 @@ test "write and read back WAL entries" {
 
         const e1 = (try reader.next()).?;
         try std.testing.expectEqual(@as(u64, 1), e1.sequence);
-        try std.testing.expectEqual(wal.OpCode.changeset, e1.op_code);
+        try std.testing.expectEqual(test_op, e1.op_code);
         try std.testing.expectEqualSlices(u8, "category-one", e1.data);
 
         const e2 = (try reader.next()).?;
         try std.testing.expectEqual(@as(u64, 2), e2.sequence);
-        try std.testing.expectEqual(wal.OpCode.changeset, e2.op_code);
+        try std.testing.expectEqual(test_op, e2.op_code);
         try std.testing.expectEqualSlices(u8, "link-data-here", e2.data);
 
         const e3 = (try reader.next()).?;
         try std.testing.expectEqual(@as(u64, 3), e3.sequence);
-        try std.testing.expectEqual(wal.OpCode.changeset, e3.op_code);
+        try std.testing.expectEqual(test_op, e3.op_code);
         try std.testing.expectEqualSlices(u8, "updated-category", e3.data);
 
         const e4_opt = try reader.next();
@@ -211,10 +209,10 @@ test "replay with min_sequence filter" {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
 
-        _ = try writer.append(.changeset, "first");
-        _ = try writer.append(.changeset, "second");
-        _ = try writer.append(.changeset, "third");
-        _ = try writer.append(.changeset, "fourth");
+        _ = try writer.append(test_op, "first");
+        _ = try writer.append(test_op, "second");
+        _ = try writer.append(test_op, "third");
+        _ = try writer.append(test_op, "fourth");
         try writer.sync();
     }
 
@@ -243,7 +241,7 @@ test "corrupted entry stops replay" {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
 
-        _ = try writer.append(.changeset, "valid-entry");
+        _ = try writer.append(test_op, "valid-entry");
         try writer.sync();
     }
 
@@ -259,7 +257,7 @@ test "corrupted entry stops replay" {
 
         const bad_header = wal.WalEntryHeader{
             .sequence = 99,
-            .op_code = @intFromEnum(wal.OpCode.changeset),
+            .op_code = test_op,
             .data_len = 5,
             .checksum = 0xDEADBEEF,
         };
@@ -318,7 +316,7 @@ test "wal_replay: single entry replays once with correct payload" {
     {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
-        _ = try writer.append(.changeset, "only-entry");
+        _ = try writer.append(test_op, "only-entry");
         try writer.sync();
     }
 
@@ -352,7 +350,7 @@ test "wal_replay: multi-entry replay preserves sequence order" {
         var buf: [16]u8 = undefined;
         for (0..50) |i| {
             const data = try std.fmt.bufPrint(&buf, "ent-{d}", .{i});
-            _ = try writer.append(.changeset, data);
+            _ = try writer.append(test_op, data);
         }
         try writer.sync();
     }
@@ -378,7 +376,7 @@ test "wal_replay: torn tail discards partial entry without error" {
         for (0..10) |i| {
             var buf: [16]u8 = undefined;
             const data = try std.fmt.bufPrint(&buf, "row-{d}", .{i});
-            _ = try writer.append(.changeset, data);
+            _ = try writer.append(test_op, data);
         }
         try writer.sync();
     }
@@ -406,9 +404,9 @@ test "wal_replay: idempotent on second pass" {
     {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
-        _ = try writer.append(.changeset, "first");
-        _ = try writer.append(.changeset, "second");
-        _ = try writer.append(.changeset, "third");
+        _ = try writer.append(test_op, "first");
+        _ = try writer.append(test_op, "second");
+        _ = try writer.append(test_op, "third");
         try writer.sync();
     }
 
@@ -436,7 +434,7 @@ test "wal_replay: oversized entry terminates replay cleanly" {
 
     const bogus_header = wal.WalEntryHeader{
         .sequence = 1,
-        .op_code = @intFromEnum(wal.OpCode.changeset),
+        .op_code = test_op,
         .data_len = 100 * 1024 * 1024,
         .checksum = 0,
     };

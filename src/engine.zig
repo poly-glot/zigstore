@@ -21,6 +21,7 @@ const freelist = @import("freelist.zig");
 const memtable = @import("memtable.zig");
 const wal = @import("wal.zig");
 const wal_replay = @import("wal_replay.zig");
+const snapshot = @import("snapshot.zig");
 
 /// The paged B+Tree backing one index (point ops + range scans over byte keys/values).
 pub const BPlusTree = @import("btree/btree.zig").BPlusTree;
@@ -292,6 +293,11 @@ pub fn Engine(comptime s: Schema) type {
 
         header_lock: std.Thread.Mutex,
 
+        apply_mutex: std.Thread.Mutex,
+        apply_cond: std.Thread.Condition,
+        last_applied_seq: u64,
+        snapshot_in_progress: std.atomic.Value(bool),
+
         /// Open (or create) the store under `config.data_dir`, returning a heap-allocated
         /// `*Store` at a stable address. On a fresh directory the header is formatted with the
         /// schema's identity and every index starts at an empty (lazily-allocated) root; on an
@@ -365,6 +371,10 @@ pub fn Engine(comptime s: Schema) type {
                 .was_empty = is_new,
                 .mt_drain_mutex = .{},
                 .header_lock = .{},
+                .apply_mutex = .{},
+                .apply_cond = .{},
+                .last_applied_seq = if (wal_writer) |w| w.sequence else 0,
+                .snapshot_in_progress = std.atomic.Value(bool).init(false),
             };
 
             inline for (s.indexes) |idx| {
@@ -572,6 +582,44 @@ pub fn Engine(comptime s: Schema) type {
             return worker;
         }
 
+        /// The `snapshot.SnapshotHost` view of this store: the in-progress guard, the data
+        /// directory, the apply and drain locks, and the four function pointers the generic
+        /// snapshot routine drives (WAL sequence, cache flush, header flush, page count). Pass
+        /// the result to `snapshot.forceSnapshot`.
+        pub fn snapshotHost(self: *Store) snapshot.SnapshotHost {
+            return .{
+                .snapshot_in_progress = &self.snapshot_in_progress,
+                .data_dir = self.config.data_dir,
+                .apply_mutex = &self.apply_mutex,
+                .mt_drain_mutex = &self.mt_drain_mutex,
+                .walSequence = snapshotWalSequence,
+                .flushCache = snapshotFlushCache,
+                .flushHeader = snapshotFlushHeader,
+                .pageCount = snapshotPageCount,
+                .ctx = self,
+            };
+        }
+
+        fn snapshotWalSequence(ctx: *anyopaque) u64 {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            return if (self.wal_writer) |*w| w.getSequence() else 0;
+        }
+
+        fn snapshotFlushCache(ctx: *anyopaque) anyerror!void {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            try self.cache.flushAll();
+        }
+
+        fn snapshotFlushHeader(ctx: *anyopaque) anyerror!void {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            try self.flushHeader();
+        }
+
+        fn snapshotPageCount(ctx: *anyopaque) u64 {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            return self.header.page_count;
+        }
+
         fn assertIndex(comptime name: [:0]const u8) void {
             if (indexOfName(s.indexes, name) == null)
                 @compileError("no index named '" ++ name ++ "' in this schema");
@@ -767,11 +815,12 @@ test "recover: applies each WAL entry once, replays-hook once, bootstraps only w
     defer allocator.free(dir);
 
     {
+        const op_code: u8 = 1;
         var w = try wal.WalWriter.init(allocator, dir, 32);
         defer w.deinit();
-        _ = try w.append(.changeset, "one");
-        _ = try w.append(.changeset, "two");
-        _ = try w.append(.changeset, "three");
+        _ = try w.append(op_code, "one");
+        _ = try w.append(op_code, "two");
+        _ = try w.append(op_code, "three");
         try w.sync();
     }
 

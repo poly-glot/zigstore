@@ -13,6 +13,10 @@
 //!     and the write memtable fronting it.
 //!   - `Config` / `Worker` / `ReplayEntry`: the per-store open config, the background-worker
 //!     handle, and one replayed WAL entry handed to a `recover` hook.
+//!   - `commit` / `snapshot` / `SnapshotHost`: the durable write path (serialize, WAL-append,
+//!     in-order apply, durability wait) over a caller-supplied record type, and point-in-time
+//!     snapshots driven through the `SnapshotHost` interface a `Store` satisfies via
+//!     `Store.snapshotHost()`.
 //!
 //! The networked half of the surface attaches to this same barrel as it lands: the
 //! binary-protocol framing/TLV codec, the epoll reactor, the generic `run` bootstrap with its
@@ -34,6 +38,12 @@ pub const MemTable = engine.MemTable;
 pub const ReplayEntry = engine.ReplayEntry;
 pub const Worker = engine.Worker;
 
+pub const snapshot = @import("snapshot.zig");
+pub const SnapshotHost = snapshot.SnapshotHost;
+pub const SnapshotResult = snapshot.SnapshotResult;
+pub const SnapshotManager = snapshot.SnapshotManager;
+pub const commit = @import("commit.zig").commit;
+
 test {
     _ = @import("codec.zig");
     _ = @import("engine.zig");
@@ -52,6 +62,8 @@ test {
 
     _ = @import("wal.zig");
     _ = @import("wal_replay.zig");
+    _ = @import("snapshot.zig");
+    _ = @import("commit.zig");
 
     _ = @import("btree/btree.zig");
     _ = @import("btree/btree_insert.zig");

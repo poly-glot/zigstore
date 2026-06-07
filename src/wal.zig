@@ -9,9 +9,7 @@ const PREALLOC_SIZE: u64 = 64 * 1024 * 1024;
 
 const PAD_BYTE: u8 = 0xFF;
 
-pub const OpCode = enum(u8) {
-    changeset = 100,
-};
+const test_op: u8 = 100;
 
 pub const WalEntryHeader = extern struct {
     sequence: u64,
@@ -159,7 +157,7 @@ pub const WalWriter = struct {
         self.write_offset = 0;
     }
 
-    pub fn append(self: *WalWriter, op: OpCode, data: []const u8) !u64 {
+    pub fn append(self: *WalWriter, op_code: u8, data: []const u8) !u64 {
         if (data.len > std.math.maxInt(u32)) return error.Overflow;
 
         const checksum = std.hash.crc.Crc32.hash(data);
@@ -172,7 +170,7 @@ pub const WalWriter = struct {
 
         const header = WalEntryHeader{
             .sequence = seq,
-            .op_code = @intFromEnum(op),
+            .op_code = op_code,
             ._pad = .{0} ** 3,
             .data_len = @intCast(data.len),
             .checksum = checksum,
@@ -456,9 +454,9 @@ test "append entries and verify sequence" {
     const writer = try initHeap(std.testing.allocator, tmp_dir, 32);
     defer deinitHeap(writer);
 
-    const seq1 = try writer.append(.changeset, "cat1");
-    const seq2 = try writer.append(.changeset, "link1");
-    const seq3 = try writer.append(.changeset, "cat1-updated");
+    const seq1 = try writer.append(test_op, "cat1");
+    const seq2 = try writer.append(test_op, "link1");
+    const seq3 = try writer.append(test_op, "cat1-updated");
 
     try std.testing.expectEqual(@as(u64, 1), seq1);
     try std.testing.expectEqual(@as(u64, 2), seq2);
@@ -476,8 +474,8 @@ test "sync flushes to disk" {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 32);
         defer deinitHeap(writer);
 
-        _ = try writer.append(.changeset, "data1");
-        _ = try writer.append(.changeset, "data2");
+        _ = try writer.append(test_op, "data1");
+        _ = try writer.append(test_op, "data2");
         try writer.sync();
     }
 
@@ -487,7 +485,7 @@ test "sync flushes to disk" {
 
         try std.testing.expectEqual(@as(u64, 2), writer2.getSequence());
 
-        const seq3 = try writer2.append(.changeset, "data3");
+        const seq3 = try writer2.append(test_op, "data3");
         try std.testing.expectEqual(@as(u64, 3), seq3);
     }
 }
@@ -501,8 +499,8 @@ test "batch auto-flush on reaching batch_size" {
     const writer = try initHeap(std.testing.allocator, tmp_dir, 3);
     defer deinitHeap(writer);
 
-    _ = try writer.append(.changeset, "a");
-    _ = try writer.append(.changeset, "b");
+    _ = try writer.append(test_op, "a");
+    _ = try writer.append(test_op, "b");
     {
         writer.lock.lock();
         const has_data = writer.front.items.len > 0;
@@ -510,7 +508,7 @@ test "batch auto-flush on reaching batch_size" {
         try std.testing.expect(has_data);
     }
 
-    _ = try writer.append(.changeset, "c");
+    _ = try writer.append(test_op, "c");
 
     std.Thread.sleep(20 * std.time.ns_per_ms);
 
@@ -537,7 +535,7 @@ test "async WAL: concurrent writers" {
         fn run(w: *WalWriter) void {
             var i: usize = 0;
             while (i < 500) : (i += 1) {
-                _ = w.append(.changeset, "concurrent-data") catch {};
+                _ = w.append(test_op, "concurrent-data") catch {};
             }
         }
     };
@@ -564,7 +562,7 @@ test "async WAL: deinit flushes all pending entries" {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 1000);
         var i: u32 = 0;
         while (i < 50) : (i += 1) {
-            _ = try writer.append(.changeset, "pending-data");
+            _ = try writer.append(test_op, "pending-data");
         }
         deinitHeap(writer);
     }
@@ -586,9 +584,9 @@ test "truncateAfterCheckpoint zeroes the WAL and resets sequence" {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 32);
         defer deinitHeap(writer);
 
-        _ = try writer.append(.changeset, "cat-a");
-        _ = try writer.append(.changeset, "link-a");
-        _ = try writer.append(.changeset, "cat-a-v2");
+        _ = try writer.append(test_op, "cat-a");
+        _ = try writer.append(test_op, "link-a");
+        _ = try writer.append(test_op, "cat-a-v2");
         try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
 
         try writer.truncateAfterCheckpoint();
@@ -602,7 +600,7 @@ test "truncateAfterCheckpoint zeroes the WAL and resets sequence" {
         const recovered = try WalWriter.scanLastSequence(scan_file, std.testing.allocator);
         try std.testing.expectEqual(@as(u64, 0), recovered);
 
-        const seq = try writer.append(.changeset, "post-truncate");
+        const seq = try writer.append(test_op, "post-truncate");
         try std.testing.expectEqual(@as(u64, 1), seq);
     }
 
@@ -628,7 +626,7 @@ const StressCtx = struct {
 fn stressAppenderRun(ctx: StressCtx) void {
     var payload: [8]u8 = undefined;
     while (!ctx.should_stop.load(.acquire)) {
-        const seq = ctx.writer.append(.changeset, &payload) catch {
+        const seq = ctx.writer.append(test_op, &payload) catch {
             return;
         };
         _ = seq;
@@ -719,7 +717,7 @@ test "stress: concurrent append + sync + truncate, then recovery contract" {
         defer deinitHeap(writer2);
         try std.testing.expectEqual(final_seq, writer2.getSequence());
         const next_payload = [_]u8{0} ** 8;
-        const new_seq = try writer2.append(.changeset, &next_payload);
+        const new_seq = try writer2.append(test_op, &next_payload);
         try std.testing.expectEqual(final_seq + 1, new_seq);
         try writer2.sync();
     }
