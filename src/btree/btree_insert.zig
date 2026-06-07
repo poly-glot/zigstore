@@ -555,6 +555,7 @@ test "stress: phase-9 shape — iter one tree while inserting into another (shar
 
     const min_key = std.mem.toBytes(@as(u64, 0));
     var iter = try existing_tree.rangeScan(&min_key, null);
+    defer iter.deinit();
     var i: u32 = 0;
     while (try iter.next()) |entry| {
         _ = entry;

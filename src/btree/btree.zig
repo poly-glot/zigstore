@@ -88,11 +88,21 @@ pub const RangeScanIterator = struct {
     current_page: PageId,
     current_slot: u32,
     end_key: ?[]const u8,
+    lock: ?*std.Thread.RwLock = null,
 
     key_buf: [256]u8 = undefined,
     val_buf: [page.PAGE_SIZE]u8 = undefined,
     key_len: u32 = 0,
     val_len: u32 = 0,
+
+    /// Release the tree's shared lock held for the scan's lifetime. Idempotent.
+    /// Every `rangeScan` caller must `defer iter.deinit()`.
+    pub fn deinit(self: *RangeScanIterator) void {
+        if (self.lock) |l| {
+            l.unlockShared();
+            self.lock = null;
+        }
+    }
 
     pub fn next(self: *RangeScanIterator) !?KV {
         while (self.current_page != INVALID_PAGE and self.current_page != 0) {

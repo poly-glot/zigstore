@@ -237,6 +237,7 @@ test "H4: leaf chain stays scannable across delete + reuse churn" {
 
     const min_key: [8]u8 = .{0} ** 8;
     var iter = try tree.rangeScan(&min_key, null);
+    defer iter.deinit();
     var expect: u64 = 1500;
     var count: u64 = 0;
     while (try iter.next()) |kv| {

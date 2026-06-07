@@ -82,7 +82,7 @@ pub fn freeSubtree(self: *BPlusTree, allocator: std.mem.Allocator, page_id: Page
 
 pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) !RangeScanIterator {
     self.lock.lockShared();
-    defer self.lock.unlockShared();
+    errdefer self.lock.unlockShared();
 
     if (self.root_page == INVALID_PAGE) {
         return RangeScanIterator{
@@ -90,6 +90,7 @@ pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) 
             .current_page = INVALID_PAGE,
             .current_slot = 0,
             .end_key = end_key,
+            .lock = &self.lock,
         };
     }
 
@@ -115,6 +116,7 @@ pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) 
         .current_page = leaf_id,
         .current_slot = start_slot,
         .end_key = end_key,
+        .lock = &self.lock,
     };
 }
 

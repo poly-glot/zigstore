@@ -222,6 +222,7 @@ test "range scan" {
     try tree.insert("e", "5");
 
     var iter = try tree.rangeScan("b", "d");
+    defer iter.deinit();
     var n: usize = 0;
     while (try iter.next()) |_| {
         n += 1;
