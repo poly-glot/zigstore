@@ -18,9 +18,14 @@
 //!     snapshots driven through the `SnapshotHost` interface a `Store` satisfies via
 //!     `Store.snapshotHost()`.
 //!
-//! The networked half of the surface attaches to this same barrel as it lands: the
-//! binary-protocol framing/TLV codec, the epoll reactor, the generic `run` bootstrap with its
-//! `ServerConfig`, and the reflection-driven TypeScript-client emitter. See the extraction
+//!   - `protocol`: the application-neutral binary framing/TLV codec (`Status`, `writeResp`,
+//!     `parsePayload`, `writeRowList`, and the pipelined `processFrames` loop with an injected
+//!     raw-`op_byte` dispatch callback).
+//!   - `ServerConfig` / `EpollServer` / `Handler` / `run`: the generic networked bootstrap — the
+//!     per-server config with its trust-list, the epoll reactor over an opaque `ctx` and runtime
+//!     `Handler`, and the `run` entry that spawns and joins the reactor pool.
+//!
+//! Still to attach: the reflection-driven TypeScript-client emitter. See the extraction
 //! design under `docs/`.
 
 const engine = @import("engine.zig");
@@ -44,6 +49,14 @@ pub const SnapshotResult = snapshot.SnapshotResult;
 pub const SnapshotManager = snapshot.SnapshotManager;
 pub const commit = @import("commit.zig").commit;
 
+pub const protocol = @import("protocol/framing.zig");
+pub const connection = @import("connection.zig");
+pub const histogram = @import("histogram.zig");
+pub const ServerConfig = @import("server_config.zig").ServerConfig;
+pub const EpollServer = @import("epoll.zig").EpollServer;
+pub const Handler = @import("epoll.zig").Handler;
+pub const run = @import("run.zig").run;
+
 test {
     _ = @import("codec.zig");
     _ = @import("engine.zig");
@@ -59,6 +72,10 @@ test {
     _ = @import("histogram.zig");
     _ = @import("connection.zig");
     _ = @import("signal.zig");
+    _ = @import("server_config.zig");
+    _ = @import("protocol/framing.zig");
+    _ = @import("epoll.zig");
+    _ = @import("run.zig");
 
     _ = @import("wal.zig");
     _ = @import("wal_replay.zig");
