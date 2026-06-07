@@ -1,6 +1,6 @@
 .{
     .name = .zigstore,
-    .version = "0.0.0-dev",
+    .version = "1.0.0",
     .fingerprint = 0x6a18cb8f8f46ee2e,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{},
