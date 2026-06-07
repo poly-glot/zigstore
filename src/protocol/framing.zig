@@ -204,13 +204,8 @@ pub fn advancePayload(
     return data[off..];
 }
 
-/// One frame's worth of response-buffer headroom the pipeline reserves before
-/// starting another frame. Sized to the largest single response the engine
-/// guarantees room for; an empty buffer always admits one frame.
-pub const RESPONSE_RESERVE: usize = 64 * 1024;
-
-fn pipelineHasRoom(resp_off: usize, buf_len: usize) bool {
-    return resp_off == 0 or buf_len - resp_off >= RESPONSE_RESERVE;
+fn pipelineHasRoom(resp_off: usize, buf_len: usize, response_reserve: usize) bool {
+    return resp_off == 0 or buf_len - resp_off >= response_reserve;
 }
 
 /// Drive the pipelined request/response loop over one connection's buffers.
@@ -222,11 +217,18 @@ fn pipelineHasRoom(resp_off: usize, buf_len: usize) bool {
 /// is passed through verbatim — this loop never maps it to an application op
 /// enum. Consumed request bytes are compacted to the front; `conn.response_len`
 /// is set to the total framed response size.
+///
+/// `response_reserve` is the caller's worst-case single-response size. The loop
+/// admits a new frame mid-batch only when the remaining response-buffer space is
+/// at least `response_reserve`, so `dispatch_fn` always receives a slice large
+/// enough for any single response the caller can produce; a frame that would not
+/// fit is deferred and emitted on the next drain at `resp_off == 0`.
 pub fn processFrames(
     ctx: *anyopaque,
     conn: *connection.Connection,
     dispatch_fn: *const fn (ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize,
     op_latency: *[256]histogram.AtomicHistogram,
+    response_reserve: usize,
 ) void {
     const bp = conn.buf orelse return;
     const data = bp.request_buf[0..conn.bytes_read];
@@ -234,7 +236,7 @@ pub fn processFrames(
     var resp_off: usize = 0;
 
     while (consumed + REQUEST_HEADER_SIZE <= data.len) {
-        if (!pipelineHasRoom(resp_off, bp.response_buf.len)) break;
+        if (!pipelineHasRoom(resp_off, bp.response_buf.len, response_reserve)) break;
         if (resp_off + RESPONSE_HEADER_SIZE > bp.response_buf.len) break;
 
         const frame = data[consumed..];
@@ -380,7 +382,7 @@ test "processFrames passes the raw op byte to dispatch, frames the response, and
     for (&op_latency) |*h| h.* = .{};
 
     var ctx = EchoCtx{};
-    processFrames(&ctx, &conn, echoDispatch, &op_latency);
+    processFrames(&ctx, &conn, echoDispatch, &op_latency, 64 * 1024);
 
     try std.testing.expectEqual(@as(u32, frames), ctx.dispatch_calls);
     try std.testing.expectEqual(op, ctx.last_op);
@@ -412,9 +414,74 @@ test "processFrames emits an invalid response for a sub-header total_len" {
     for (&op_latency) |*h| h.* = .{};
 
     var ctx = EchoCtx{};
-    processFrames(&ctx, &conn, echoDispatch, &op_latency);
+    processFrames(&ctx, &conn, echoDispatch, &op_latency, 64 * 1024);
 
     try std.testing.expectEqual(@as(u32, 0), ctx.dispatch_calls);
     try std.testing.expectEqual(@as(usize, RESPONSE_HEADER_SIZE), conn.response_len);
     try std.testing.expectEqual(@intFromEnum(Status.invalid), bp.response_buf[5]);
+}
+
+const ROW_LIST_OP: u8 = 2;
+const ROW_LIST_ITEMS: u16 = 2600;
+const RowRecord = [64]u8;
+const FIRST_FRAME_RESPONSE: usize = 100_000;
+
+const TruncatingCtx = struct {
+    dispatch_calls: u32 = 0,
+    rows: [ROW_LIST_ITEMS]RowRecord = undefined,
+};
+
+fn truncatingDispatch(ctx: *anyopaque, op_byte: u8, _: []const u8, _: u16, resp: []u8) usize {
+    const self: *TruncatingCtx = @ptrCast(@alignCast(ctx));
+    self.dispatch_calls += 1;
+    if (op_byte == ROW_LIST_OP) {
+        return writeRowList(RowRecord, resp, op_byte, &self.rows);
+    }
+    if (resp.len < RESPONSE_HEADER_SIZE + FIRST_FRAME_RESPONSE) return 0;
+    @memset(resp[RESPONSE_HEADER_SIZE..][0..FIRST_FRAME_RESPONSE], op_byte);
+    writeOkHeader(resp, op_byte, @intCast(RESPONSE_HEADER_SIZE + FIRST_FRAME_RESPONSE), 0);
+    return RESPONSE_HEADER_SIZE + FIRST_FRAME_RESPONSE;
+}
+
+test "processFrames defers a row-list frame past the reserve so it is written in full, never truncated" {
+    var bp = connection.BufferPair{};
+    var conn = connection.Connection{};
+    conn.buf = &bp;
+
+    const reserve: usize = 200_000;
+
+    var off: usize = 0;
+    for ([_]u8{ 1, ROW_LIST_OP }) |op_byte| {
+        const total: u32 = @intCast(REQUEST_HEADER_SIZE);
+        std.mem.writeInt(u32, bp.request_buf[off..][0..4], total, .little);
+        bp.request_buf[off + 4] = op_byte;
+        bp.request_buf[off + 5] = 0;
+        std.mem.writeInt(u16, bp.request_buf[off + 6 ..][0..2], 0, .little);
+        off += total;
+    }
+    conn.bytes_read = off;
+
+    var op_latency: [256]histogram.AtomicHistogram = undefined;
+    for (&op_latency) |*h| h.* = .{};
+
+    var ctx = TruncatingCtx{};
+    processFrames(&ctx, &conn, truncatingDispatch, &op_latency, reserve);
+
+    const first_len = RESPONSE_HEADER_SIZE + FIRST_FRAME_RESPONSE;
+    try std.testing.expectEqual(@as(u32, 1), ctx.dispatch_calls);
+    try std.testing.expectEqual(first_len, conn.response_len);
+    try std.testing.expectEqual(@as(u8, 1), bp.response_buf[4]);
+
+    try std.testing.expectEqual(@as(usize, REQUEST_HEADER_SIZE), conn.bytes_read);
+    try std.testing.expectEqual(ROW_LIST_OP, bp.request_buf[4]);
+
+    processFrames(&ctx, &conn, truncatingDispatch, &op_latency, reserve);
+
+    const full_len = RESPONSE_HEADER_SIZE + @as(usize, ROW_LIST_ITEMS) * @sizeOf(RowRecord);
+    try std.testing.expectEqual(@as(u32, 2), ctx.dispatch_calls);
+    try std.testing.expectEqual(full_len, conn.response_len);
+    try std.testing.expectEqual(ROW_LIST_OP, bp.response_buf[4]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), bp.response_buf[5]);
+    try std.testing.expectEqual(ROW_LIST_ITEMS, std.mem.readInt(u16, bp.response_buf[8..10], .little));
+    try std.testing.expectEqual(@as(usize, 0), conn.bytes_read);
 }
