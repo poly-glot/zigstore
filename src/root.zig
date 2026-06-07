@@ -9,7 +9,10 @@
 //!   - `codec`: the application-neutral byte-codec toolkit (`FixedString`, `CompositeKey`,
 //!     `encodeU64`/`decodeU64`, `Serializable`, `hash`).
 //!   - `wire_codec`: generic `@typeInfo`-driven struct/field marshalling for record encoding.
-//!   - `OrderedTree`: the ordered map an index is built on (point ops + range scans).
+//!   - `BPlusTree` / `MemTable`: the paged tree an index is built on (point ops + range scans)
+//!     and the write memtable fronting it.
+//!   - `Config` / `Worker` / `ReplayEntry`: the per-store open config, the background-worker
+//!     handle, and one replayed WAL entry handed to a `recover` hook.
 //!
 //! The networked half of the surface attaches to this same barrel as it lands: the
 //! binary-protocol framing/TLV codec, the epoll reactor, the generic `run` bootstrap with its
@@ -26,12 +29,16 @@ pub const Schema = engine.Schema;
 pub const IndexSpec = engine.IndexSpec;
 pub const KeyKind = engine.KeyKind;
 pub const Engine = engine.Engine;
-pub const OrderedTree = engine.OrderedTree;
+pub const BPlusTree = engine.BPlusTree;
+pub const MemTable = engine.MemTable;
+pub const ReplayEntry = engine.ReplayEntry;
+pub const Worker = engine.Worker;
 
 test {
     _ = @import("codec.zig");
     _ = @import("engine.zig");
     _ = @import("wire_codec.zig");
+    _ = @import("file_header.zig");
 
     _ = @import("page.zig");
     _ = @import("page_cache.zig");
