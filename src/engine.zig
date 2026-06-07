@@ -1,17 +1,40 @@
 //! The comptime data plane: an app declares its store as a `Schema`, and `Engine(schema)`
-//! generates the typed storage layer: a superblock `Header` with a root/count slot per
-//! index and a slot per persisted counter, plus the named ordered byte-key/byte-value
-//! trees themselves.
+//! generates the typed, on-disk paged storage layer: a `PAGE_SIZE` superblock `Header` with a
+//! root/count slot per index and a slot per persisted counter, the named paged B+Trees
+//! themselves, and the write memtables fronting the subset of indexes the schema marks.
 //!
-//! This generalizes the hand-rolled index table that a concrete consumer would otherwise
-//! walk with `inline for`: declare the indexes once, and the header layout, the trees, and
-//! the counters are all generated from that single source.
+//! This generalizes the hand-rolled index table a concrete consumer would otherwise walk with
+//! `inline for`: declare the indexes once, and the header layout, the trees, the memtables,
+//! and the counters are all generated from that single source.
 //!
-//! The tree backing in this cut is an in-memory ordered map. The on-disk paged B+Tree,
-//! WAL, and snapshot machinery attach behind this same surface without changing it.
+//! The backing is the real paged B+Tree over a page cache, free list, and WAL. The engine owns
+//! durability and recovery ordering but imports no application module: per-entry WAL decode and
+//! the bootstrap of a fresh store are supplied by the caller through the `recover` hooks, and
+//! background maintenance runs through the generic `spawnWorker` seam.
 
 const std = @import("std");
 const codec = @import("codec.zig");
+const page = @import("page.zig");
+const file_header = @import("file_header.zig");
+const page_cache = @import("page_cache.zig");
+const freelist = @import("freelist.zig");
+const memtable = @import("memtable.zig");
+const wal = @import("wal.zig");
+const wal_replay = @import("wal_replay.zig");
+const snapshot = @import("snapshot.zig");
+
+/// The paged B+Tree backing one index (point ops + range scans over byte keys/values).
+pub const BPlusTree = @import("btree/btree.zig").BPlusTree;
+
+/// The sharded write memtable fronting an index until it drains into the index's B+Tree.
+pub const MemTable = memtable.MemTable;
+
+const MEMTABLE_SHARDS = memtable.NUM_SHARDS;
+
+/// One replayed WAL entry handed to a `recover` hook: its sequence, op code, and payload bytes.
+pub const ReplayEntry = wal_replay.ReplayEntry;
+
+const log = std.log.scoped(.engine);
 
 /// How an index orders its keys. The kind is metadata for validation and client codegen;
 /// the store compares the encoded key bytes either way, so big-endian encodings
@@ -102,19 +125,30 @@ fn structField(comptime name: [:0]const u8, comptime T: type) std.builtin.Type.S
     };
 }
 
+fn headerPrefixSize(comptime s: Schema) usize {
+    comptime {
+        var size: usize = 4 * @sizeOf(u32) + 3 * @sizeOf(u64);
+        size += s.indexes.len * 2 * @sizeOf(u64);
+        size += s.counters.len * @sizeOf(u64);
+        return size;
+    }
+}
+
 fn HeaderType(comptime s: Schema) type {
     comptime {
+        if (headerPrefixSize(s) > page.PAGE_SIZE) @compileError("zigstore schema: header (indexes+counters) exceeds PAGE_SIZE; reduce indexes/counters");
+        const reserved_len = page.PAGE_SIZE - headerPrefixSize(s);
         const generic = [_]std.builtin.Type.StructField{
             structField("magic", u32),
             structField("format_version", u32),
             structField("page_size", u32),
-            structField("_reserved", u32),
+            structField("_pad", u32),
             structField("free_list_head", u64),
             structField("page_count", u64),
             structField("seq", u64),
         };
 
-        var fields: [generic.len + s.indexes.len * 2 + s.counters.len]std.builtin.Type.StructField = undefined;
+        var fields: [generic.len + s.indexes.len * 2 + s.counters.len + 1]std.builtin.Type.StructField = undefined;
         var n: usize = 0;
         for (generic) |f| {
             fields[n] = f;
@@ -130,6 +164,8 @@ fn HeaderType(comptime s: Schema) type {
             fields[n] = structField(c, u64);
             n += 1;
         }
+        fields[n] = structField("_reserved", [reserved_len]u8);
+        n += 1;
 
         return @Type(.{ .@"struct" = .{
             .layout = .@"extern",
@@ -144,7 +180,7 @@ fn TreesType(comptime s: Schema) type {
     comptime {
         var fields: [s.indexes.len]std.builtin.Type.StructField = undefined;
         for (s.indexes, 0..) |idx, i| {
-            fields[i] = structField(idx.name, OrderedTree);
+            fields[i] = structField(idx.name, BPlusTree);
         }
         return @Type(.{ .@"struct" = .{
             .layout = .auto,
@@ -155,77 +191,445 @@ fn TreesType(comptime s: Schema) type {
     }
 }
 
-/// Generate the typed `Store` for a comptime `Schema`.
+fn MemtablesType(comptime s: Schema) type {
+    comptime {
+        var fields: [s.memtable_indexes.len]std.builtin.Type.StructField = undefined;
+        for (s.memtable_indexes, 0..) |name, i| {
+            fields[i] = structField(name, MemTable);
+        }
+        return @Type(.{ .@"struct" = .{
+            .layout = .auto,
+            .fields = &fields,
+            .decls = &.{},
+            .is_tuple = false,
+        } });
+    }
+}
+
+/// A generic background worker spawned by `Store.spawnWorker`: a thread that fires the
+/// supplied `tick` on a fixed interval until `stop` joins it cleanly.
+pub const Worker = struct {
+    thread: std.Thread,
+    shutdown: std.atomic.Value(bool),
+    cond: std.Thread.Condition,
+    mutex: std.Thread.Mutex,
+    interval_ns: u64,
+    ctx: *anyopaque,
+    tick: *const fn (ctx: *anyopaque) anyerror!void,
+    allocator: std.mem.Allocator,
+
+    /// Signal the worker to stop, wait for the current tick to finish, join the thread, and
+    /// free the worker. Safe to call exactly once.
+    pub fn stop(self: *Worker) void {
+        self.mutex.lock();
+        self.shutdown.store(true, .release);
+        self.cond.signal();
+        self.mutex.unlock();
+        self.thread.join();
+        self.allocator.destroy(self);
+    }
+
+    fn loop(self: *Worker) void {
+        while (true) {
+            self.mutex.lock();
+            if (!self.shutdown.load(.acquire)) {
+                self.cond.timedWait(&self.mutex, self.interval_ns) catch {};
+            }
+            const stopping = self.shutdown.load(.acquire);
+            self.mutex.unlock();
+
+            if (stopping) break;
+            self.tick(self.ctx) catch |err| {
+                log.warn("worker tick failed: {}", .{err});
+            };
+        }
+    }
+};
+
+/// Generate the typed paged `Store` for a comptime `Schema`.
 ///
-/// The returned type exposes `Header` (the generated superblock), `open`/`deinit`,
-/// per-index tree access via `tree(name)`, and persisted-counter access via `counter(name)`
-/// / `nextId(name)`. Tree and counter names are checked at comptime against the schema.
+/// The returned type exposes `Header` (the generated superblock), `Config`, `init`/`deinit`,
+/// per-index tree access via `tree(name)`, per-memtable access via `memtable(name)`,
+/// persisted-counter access via `counter(name)` / `nextId(name)`, durable `flushHeader`,
+/// memtable draining via `drainMemtables`, and the `recover`/`spawnWorker` runtime seams. Tree,
+/// memtable, and counter names are checked at comptime against the schema.
 pub fn Engine(comptime s: Schema) type {
     return struct {
         const Store = @This();
 
         /// The generated superblock: the generic `magic`/`format_version`/`page_size`/
         /// `free_list_head`/`page_count`/`seq` fields, a `<name>_root`/`<name>_count` pair
-        /// per index, and a slot per declared counter. App-supplied `magic`; no schema
-        /// field names are hardcoded by the engine.
+        /// per index, a slot per declared counter, and a trailing `_reserved` pad to
+        /// `PAGE_SIZE`. App-supplied `magic`; no schema field names are hardcoded.
         pub const Header = HeaderType(s);
 
         /// The compile-time schema this store was generated from.
         pub const schema_def = s;
 
+        /// Open/create configuration: the on-disk data directory and the page-cache budget.
+        pub const Config = struct {
+            data_dir: []const u8,
+            cache_size_mb: u32 = 64,
+            wal_batch_size: u32 = 32,
+        };
+
         const Trees = TreesType(s);
+        const Memtables = MemtablesType(s);
 
         allocator: std.mem.Allocator,
+        config: Config,
+        file: std.fs.File,
         header: Header,
+        cache: page_cache.PageCache,
+        free_list: freelist.FreeList,
+        wal_writer: ?wal.WalWriter,
+
         trees: Trees,
+        memtables: Memtables,
 
-        /// Open a fresh in-memory store. The header is zeroed and stamped with the schema's
-        /// `magic`, `format_version`, and a 16 KB `page_size`; every declared tree is
-        /// initialized empty.
-        pub fn open(allocator: std.mem.Allocator) Store {
-            var store: Store = .{
-                .allocator = allocator,
-                .header = std.mem.zeroes(Header),
-                .trees = undefined,
+        was_empty: bool,
+
+        mt_drain_mutex: std.Thread.Mutex,
+
+        header_lock: std.Thread.Mutex,
+
+        apply_mutex: std.Thread.Mutex,
+        apply_cond: std.Thread.Condition,
+        last_applied_seq: u64,
+        snapshot_in_progress: std.atomic.Value(bool),
+
+        /// Open (or create) the store under `config.data_dir`, returning a heap-allocated
+        /// `*Store` at a stable address. On a fresh directory the header is formatted with the
+        /// schema's identity and every index starts at an empty (lazily-allocated) root; on an
+        /// existing one the header is loaded and validated and each tree is wired to the shared
+        /// cache/free list at its persisted root and count. The store owns its own allocation:
+        /// every tree's `cache`/`free_list` and the free list's `cache` are bound to the settled
+        /// in-place pointers and the WAL flusher is started before returning, so the value never
+        /// needs an external rebind. Release it with `deinit`.
+        pub fn init(allocator: std.mem.Allocator, config: Config) !*Store {
+            std.fs.makeDirAbsolute(config.data_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
             };
-            store.header.magic = s.magic;
-            store.header.format_version = s.format_version;
-            store.header.page_size = 16 * 1024;
-            inline for (s.indexes) |idx| {
-                @field(store.trees, idx.name) = OrderedTree.init(allocator);
+
+            const path = try std.fmt.allocPrint(allocator, "{s}/store.dat", .{config.data_dir});
+            defer allocator.free(path);
+
+            const file = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = false });
+            errdefer file.close();
+
+            const file_size = (try file.stat()).size;
+            const is_new = file_size == 0;
+
+            var header: Header = undefined;
+            if (is_new) {
+                header = std.mem.zeroes(Header);
+                header.magic = s.magic;
+                header.format_version = s.format_version;
+                header.page_size = page.PAGE_SIZE;
+                header.free_list_head = page.INVALID_PAGE;
+                inline for (s.indexes) |idx| {
+                    @field(header, idx.name ++ "_root") = page.INVALID_PAGE;
+                }
+
+                const header_bytes = file_header.serialize(header);
+                try file.seekTo(0);
+                try file.writeAll(&header_bytes);
+                try file.sync();
+            } else {
+                try file.seekTo(0);
+                var header_buf: [page.PAGE_SIZE]u8 = undefined;
+                const bytes_read = try file.readAll(&header_buf);
+                if (bytes_read < @sizeOf(Header)) return error.UnexpectedEof;
+                header = file_header.deserialize(Header, &header_buf);
+                try file_header.validate(header, s.magic, s.format_version);
             }
-            return store;
+
+            const cache_pages = (config.cache_size_mb * 1024 * 1024) / page.PAGE_SIZE;
+            var cache = try page_cache.PageCache.init(allocator, file, cache_pages);
+            errdefer cache.deinit();
+
+            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size) catch |err| blk: {
+                log.warn("WAL open failed: {} — continuing without WAL", .{err});
+                break :blk null;
+            };
+            errdefer if (wal_writer) |*w| w.deinit();
+
+            const self = try allocator.create(Store);
+            errdefer allocator.destroy(self);
+
+            self.* = Store{
+                .allocator = allocator,
+                .config = config,
+                .file = file,
+                .header = header,
+                .cache = cache,
+                .free_list = .{ .head = @intCast(header.free_list_head), .cache = undefined, .mutex = .{} },
+                .wal_writer = wal_writer,
+                .trees = undefined,
+                .memtables = undefined,
+                .was_empty = is_new,
+                .mt_drain_mutex = .{},
+                .header_lock = .{},
+                .apply_mutex = .{},
+                .apply_cond = .{},
+                .last_applied_seq = if (wal_writer) |w| w.sequence else 0,
+                .snapshot_in_progress = std.atomic.Value(bool).init(false),
+            };
+
+            inline for (s.indexes) |idx| {
+                @field(self.trees, idx.name) = BPlusTree.init(
+                    undefined,
+                    undefined,
+                    @intCast(@field(header, idx.name ++ "_root")),
+                );
+                @field(self.trees, idx.name).entry_count = @field(header, idx.name ++ "_count");
+            }
+
+            inline for (s.memtable_indexes) |name| {
+                @field(self.memtables, name) = MemTable.init(allocator);
+            }
+            errdefer inline for (s.memtable_indexes) |name| {
+                @field(self.memtables, name).deinit();
+            };
+
+            self.free_list.cache = &self.cache;
+            inline for (s.indexes) |idx| {
+                @field(self.trees, idx.name).cache = &self.cache;
+                @field(self.trees, idx.name).free_list = &self.free_list;
+            }
+            if (self.wal_writer) |*w| {
+                w.startFlusher() catch |err| {
+                    log.warn("WAL flusher start failed: {}", .{err});
+                };
+            }
+
+            return self;
         }
 
-        /// Free every named tree and the keys/values it owns.
+        /// Tear down the store the `init` heap-allocated: drain memtables, flush dirty pages and
+        /// the header, close the WAL and data file, free every owned resource, and finally
+        /// `destroy` the store allocation itself. Call once on the `*Store` returned by `init`;
+        /// the pointer is invalid afterward.
         pub fn deinit(self: *Store) void {
-            inline for (s.indexes) |idx| {
-                @field(self.trees, idx.name).deinit();
+            self.drainMemtables() catch |err| {
+                log.err("deinit drain failed: {}", .{err});
+            };
+            self.cache.flushAll() catch |err| {
+                log.err("deinit cache flush failed: {}", .{err});
+            };
+            self.flushHeader() catch |err| {
+                log.err("deinit header flush failed: {}", .{err});
+            };
+
+            if (self.wal_writer) |*w| w.deinit();
+
+            inline for (s.memtable_indexes) |name| {
+                @field(self.memtables, name).deinit();
             }
+            self.cache.deinit();
+            self.file.close();
+
+            const allocator = self.allocator;
+            allocator.destroy(self);
         }
 
-        /// A pointer to the named index's tree. The name is resolved and checked at comptime.
-        pub fn tree(self: *Store, comptime name: [:0]const u8) *OrderedTree {
+        /// A pointer to the named index's B+Tree. The name is resolved and checked at comptime.
+        pub fn tree(self: *Store, comptime name: [:0]const u8) *BPlusTree {
             comptime assertIndex(name);
             return &@field(self.trees, name);
         }
 
-        /// A pointer to the named counter's persisted slot in the header.
+        /// A pointer to the named index's write memtable. The name must be a declared
+        /// `memtable_index`; otherwise this is a comptime error.
+        pub fn memtable(self: *Store, comptime name: [:0]const u8) *MemTable {
+            comptime assertMemtable(name);
+            return &@field(self.memtables, name);
+        }
+
+        /// A pointer to the named counter's persisted slot in the header. Single-writer:
+        /// the caller serializes all counter mutations; this raw header field is written
+        /// non-atomically and must not be touched concurrently with another counter
+        /// mutation or with `flushHeader` (which reads the header under `header_lock`).
         pub fn counter(self: *Store, comptime name: [:0]const u8) *u64 {
             comptime assertCounter(name);
             return &@field(self.header, name);
         }
 
         /// Increment the named counter and return its new value. Allocates ids from `1`.
+        /// Single-writer / caller-serialized: the read-modify-write is non-atomic, so the
+        /// caller must not call it concurrently with another counter mutation or with
+        /// `flushHeader`.
         pub fn nextId(self: *Store, comptime name: [:0]const u8) u64 {
             const slot = self.counter(name);
             slot.* += 1;
             return slot.*;
         }
 
+        /// Drain every write memtable into its backing B+Tree: tombstones delete, live entries
+        /// insert, applied in shard order. Serialized against concurrent drains.
+        pub fn drainMemtables(self: *Store) !void {
+            self.mt_drain_mutex.lock();
+            defer self.mt_drain_mutex.unlock();
+            inline for (s.memtable_indexes) |name| {
+                try drainOne(&@field(self.memtables, name), &@field(self.trees, name));
+            }
+        }
+
+        fn drainOne(mt: *MemTable, dst: *BPlusTree) !void {
+            mt.lockAll();
+            var backs: [MEMTABLE_SHARDS]*MemTable.Buffer = undefined;
+            for (0..MEMTABLE_SHARDS) |i| backs[i] = mt.swapShardLocked(i);
+            mt.unlockAll();
+
+            for (0..MEMTABLE_SHARDS) |i| {
+                var it = backs[i].map.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    const val = entry.value_ptr.*;
+                    if (val.tombstone) {
+                        _ = try dst.delete(key);
+                    } else {
+                        try dst.insert(key, val.value);
+                    }
+                }
+            }
+
+            mt.lockAll();
+            for (0..MEMTABLE_SHARDS) |i| mt.resetShardBackLocked(i);
+            mt.unlockAll();
+        }
+
+        /// Sync every tree's live root/count and the persisted counters into the header, then
+        /// write the superblock to page 0 and fsync. Serialized by the header lock.
+        pub fn flushHeader(self: *Store) !void {
+            self.header_lock.lock();
+            defer self.header_lock.unlock();
+
+            inline for (s.indexes) |idx| {
+                @field(self.header, idx.name ++ "_root") = @field(self.trees, idx.name).getRootPage();
+                @field(self.header, idx.name ++ "_count") = @field(self.trees, idx.name).entryCount();
+            }
+            self.header.free_list_head = self.free_list.getHead();
+            self.cache.alloc_lock.lock();
+            self.header.page_count = self.cache.page_count;
+            self.cache.alloc_lock.unlock();
+
+            const header_bytes = file_header.serialize(self.header);
+            try self.file.seekTo(0);
+            try self.file.writeAll(&header_bytes);
+            try self.file.sync();
+        }
+
+        /// Replay the WAL, drain, flush, and bootstrap — the engine owns the ordering, the
+        /// caller owns the per-entry semantics. For each decoded entry past the checkpoint,
+        /// `apply_entry(ctx, entry)` runs; then memtables drain and the header is flushed;
+        /// then `on_replayed(ctx)` runs; and if the store opened empty, `bootstrap(ctx)` runs.
+        /// The engine imports no application module — decoding and applying an entry lives
+        /// entirely inside `apply_entry`.
+        pub fn recover(self: *Store, ctx: *anyopaque, hooks: struct {
+            apply_entry: *const fn (ctx: *anyopaque, entry: ReplayEntry) anyerror!void,
+            on_replayed: *const fn (ctx: *anyopaque) anyerror!void,
+            bootstrap: *const fn (ctx: *anyopaque) anyerror!void,
+        }) !void {
+            var applier = ReplayAdapter{ .ctx = ctx, .apply_entry = hooks.apply_entry };
+            const last_seq = wal_replay.replayWal(self.config.data_dir, 0, &applier) catch |err| {
+                log.err("WAL replay failed: {}", .{err});
+                return err;
+            };
+
+            if (last_seq > 0) {
+                try self.drainMemtables();
+                self.cache.flushAll() catch |err| {
+                    log.err("recover cache flush failed: {}", .{err});
+                };
+                try self.flushHeader();
+            }
+
+            try hooks.on_replayed(ctx);
+
+            if (self.was_empty) try hooks.bootstrap(ctx);
+        }
+
+        const ReplayAdapter = struct {
+            ctx: *anyopaque,
+            apply_entry: *const fn (ctx: *anyopaque, entry: ReplayEntry) anyerror!void,
+
+            pub fn apply(self: *ReplayAdapter, entry: ReplayEntry) !void {
+                try self.apply_entry(self.ctx, entry);
+            }
+        };
+
+        /// Spawn a background worker that fires `cfg.tick(ctx)` every `cfg.interval_ns`. Returns
+        /// an owned `*Worker`; call `worker.stop()` to halt and join it.
+        pub fn spawnWorker(self: *Store, ctx: *anyopaque, cfg: struct {
+            interval_ns: u64,
+            tick: *const fn (ctx: *anyopaque) anyerror!void,
+        }) !*Worker {
+            const worker = try self.allocator.create(Worker);
+            errdefer self.allocator.destroy(worker);
+            worker.* = .{
+                .thread = undefined,
+                .shutdown = std.atomic.Value(bool).init(false),
+                .cond = .{},
+                .mutex = .{},
+                .interval_ns = cfg.interval_ns,
+                .ctx = ctx,
+                .tick = cfg.tick,
+                .allocator = self.allocator,
+            };
+            worker.thread = try std.Thread.spawn(.{}, Worker.loop, .{worker});
+            return worker;
+        }
+
+        /// The `snapshot.SnapshotHost` view of this store: the in-progress guard, the data
+        /// directory, the apply and drain locks, and the four function pointers the generic
+        /// snapshot routine drives (WAL sequence, cache flush, header flush, page count). Pass
+        /// the result to `snapshot.forceSnapshot`.
+        pub fn snapshotHost(self: *Store) snapshot.SnapshotHost {
+            return .{
+                .snapshot_in_progress = &self.snapshot_in_progress,
+                .data_dir = self.config.data_dir,
+                .apply_mutex = &self.apply_mutex,
+                .mt_drain_mutex = &self.mt_drain_mutex,
+                .walSequence = snapshotWalSequence,
+                .flushCache = snapshotFlushCache,
+                .flushHeader = snapshotFlushHeader,
+                .pageCount = snapshotPageCount,
+                .ctx = self,
+            };
+        }
+
+        fn snapshotWalSequence(ctx: *anyopaque) u64 {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            return if (self.wal_writer) |*w| w.getSequence() else 0;
+        }
+
+        fn snapshotFlushCache(ctx: *anyopaque) anyerror!void {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            try self.cache.flushAll();
+        }
+
+        fn snapshotFlushHeader(ctx: *anyopaque) anyerror!void {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            try self.flushHeader();
+        }
+
+        fn snapshotPageCount(ctx: *anyopaque) u64 {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            return self.header.page_count;
+        }
+
         fn assertIndex(comptime name: [:0]const u8) void {
             if (indexOfName(s.indexes, name) == null)
                 @compileError("no index named '" ++ name ++ "' in this schema");
+        }
+
+        fn assertMemtable(comptime name: [:0]const u8) void {
+            for (s.memtable_indexes) |m| {
+                if (std.mem.eql(u8, m, name)) return;
+            }
+            @compileError("no memtable index named '" ++ name ++ "' in this schema");
         }
 
         fn assertCounter(comptime name: [:0]const u8) void {
@@ -236,122 +640,6 @@ pub fn Engine(comptime s: Schema) type {
         }
     };
 }
-
-/// An ordered byte-key/byte-value map: point read/write/delete and ascending range scans,
-/// with the store owning copies of every key and value. The v0 backing for an `Engine`
-/// index; range order matches lexical key order, so big-endian encodings scan numerically.
-pub const OrderedTree = struct {
-    allocator: std.mem.Allocator,
-    entries: std.ArrayListUnmanaged(Entry),
-
-    const Entry = struct { key: []u8, value: []u8 };
-
-    /// An empty tree that allocates its owned keys and values from `allocator`.
-    pub fn init(allocator: std.mem.Allocator) OrderedTree {
-        return .{ .allocator = allocator, .entries = .{} };
-    }
-
-    /// Free every stored key and value, then the tree's own storage.
-    pub fn deinit(self: *OrderedTree) void {
-        for (self.entries.items) |e| {
-            self.allocator.free(e.key);
-            self.allocator.free(e.value);
-        }
-        self.entries.deinit(self.allocator);
-    }
-
-    fn lowerBound(self: *const OrderedTree, key: []const u8) usize {
-        var lo: usize = 0;
-        var hi: usize = self.entries.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (std.mem.order(u8, self.entries.items[mid].key, key) == .lt) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        return lo;
-    }
-
-    /// Insert or replace the value at `key`. The tree copies both `key` and `value`.
-    pub fn put(self: *OrderedTree, key: []const u8, value: []const u8) !void {
-        const at = self.lowerBound(key);
-        if (at < self.entries.items.len and std.mem.eql(u8, self.entries.items[at].key, key)) {
-            const new_value = try self.allocator.dupe(u8, value);
-            self.allocator.free(self.entries.items[at].value);
-            self.entries.items[at].value = new_value;
-            return;
-        }
-        const key_copy = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(key_copy);
-        const value_copy = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(value_copy);
-        try self.entries.insert(self.allocator, at, .{ .key = key_copy, .value = value_copy });
-    }
-
-    /// The value stored at `key`, or null. Borrowed from the tree; valid until the next
-    /// mutation of this tree.
-    pub fn get(self: *const OrderedTree, key: []const u8) ?[]const u8 {
-        const at = self.lowerBound(key);
-        if (at < self.entries.items.len and std.mem.eql(u8, self.entries.items[at].key, key))
-            return self.entries.items[at].value;
-        return null;
-    }
-
-    /// Remove `key`. Returns whether a row was removed.
-    pub fn delete(self: *OrderedTree, key: []const u8) bool {
-        const at = self.lowerBound(key);
-        if (at < self.entries.items.len and std.mem.eql(u8, self.entries.items[at].key, key)) {
-            const removed = self.entries.orderedRemove(at);
-            self.allocator.free(removed.key);
-            self.allocator.free(removed.value);
-            return true;
-        }
-        return false;
-    }
-
-    /// The number of rows in the tree.
-    pub fn count(self: *const OrderedTree) usize {
-        return self.entries.items.len;
-    }
-
-    /// One row yielded by an `Iterator`: borrowed key and value, valid until the next mutation.
-    pub const Row = struct { key: []const u8, value: []const u8 };
-
-    /// An ascending cursor over a key range; obtained from `iterator` or `range`.
-    pub const Iterator = struct {
-        tree: *const OrderedTree,
-        i: usize,
-        end: usize,
-        upper: ?[]const u8,
-
-        /// The next row in ascending key order, or null at the end of the range.
-        pub fn next(self: *Iterator) ?Row {
-            if (self.i >= self.end) return null;
-            const e = self.tree.entries.items[self.i];
-            if (self.upper) |hi| {
-                if (std.mem.order(u8, e.key, hi) != .lt) {
-                    self.i = self.end;
-                    return null;
-                }
-            }
-            self.i += 1;
-            return .{ .key = e.key, .value = e.value };
-        }
-    };
-
-    /// Ascending iterator over every row.
-    pub fn iterator(self: *const OrderedTree) Iterator {
-        return .{ .tree = self, .i = 0, .end = self.entries.items.len, .upper = null };
-    }
-
-    /// Ascending iterator over the half-open key range `[lo, hi)`. A null `hi` scans to the
-    /// end. With big-endian keys this is the primitive a subtree/prefix scan is built from.
-    pub fn range(self: *const OrderedTree, lo: []const u8, hi: ?[]const u8) Iterator {
-        return .{ .tree = self, .i = self.lowerBound(lo), .end = self.entries.items.len, .upper = hi };
-    }
-};
 
 const test_schema = schema(.{
     .magic = 0x5A494753,
@@ -367,77 +655,234 @@ const test_schema = schema(.{
 
 const TestStore = Engine(test_schema);
 
-test "Header carries magic, generic slots, and a root/count per index" {
+fn openTestStore(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !*TestStore {
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    errdefer allocator.free(path);
+    return TestStore.init(allocator, .{ .data_dir = path, .cache_size_mb = 16 });
+}
+
+fn closeTestStore(store: *TestStore) void {
+    const allocator = store.allocator;
+    const data_dir = store.config.data_dir;
+    store.deinit();
+    allocator.free(data_dir);
+}
+
+test "Header carries magic, generic slots, a root/count per index, and is PAGE_SIZE" {
     try std.testing.expect(@hasField(TestStore.Header, "magic"));
     try std.testing.expect(@hasField(TestStore.Header, "seq"));
     try std.testing.expect(@hasField(TestStore.Header, "by_id_root"));
     try std.testing.expect(@hasField(TestStore.Header, "by_id_count"));
     try std.testing.expect(@hasField(TestStore.Header, "by_slug_root"));
     try std.testing.expect(@hasField(TestStore.Header, "next_seq"));
+    try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), @sizeOf(TestStore.Header));
 }
 
-test "open stamps the app magic and 16 KB page size" {
-    var store = TestStore.open(std.testing.allocator);
-    defer store.deinit();
-    try std.testing.expectEqual(@as(u32, 0x5A494753), store.header.magic);
-    try std.testing.expectEqual(@as(u32, 16 * 1024), store.header.page_size);
-}
+test "paged store: insert, flushHeader, reopen, search round-trips through page 0" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-test "point write / read / delete on a named tree" {
-    var store = TestStore.open(std.testing.allocator);
-    defer store.deinit();
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
 
-    const by_id = store.tree("by_id");
-    try by_id.put(&codec.encodeU64(2), "two");
-    try by_id.put(&codec.encodeU64(1), "one");
-    try by_id.put(&codec.encodeU64(2), "TWO");
+        const id = store.nextId("next_id");
+        try std.testing.expectEqual(@as(u64, 1), id);
 
-    try std.testing.expectEqualSlices(u8, "one", by_id.get(&codec.encodeU64(1)).?);
-    try std.testing.expectEqualSlices(u8, "TWO", by_id.get(&codec.encodeU64(2)).?);
-    try std.testing.expectEqual(@as(usize, 2), by_id.count());
-    try std.testing.expect(by_id.delete(&codec.encodeU64(1)));
-    try std.testing.expect(by_id.get(&codec.encodeU64(1)) == null);
-}
-
-test "range scan returns big-endian keys in ascending numeric order" {
-    var store = TestStore.open(std.testing.allocator);
-    defer store.deinit();
-
-    const by_id = store.tree("by_id");
-    for ([_]u64{ 30, 10, 20, 40 }) |id| {
-        try by_id.put(&codec.encodeU64(id), "x");
+        try store.tree("by_id").insert(&codec.encodeU64(id), "hello");
+        try store.flushHeader();
     }
 
-    var seen: [4]u64 = undefined;
-    var n: usize = 0;
-    var it = by_id.iterator();
-    while (it.next()) |row| : (n += 1) seen[n] = codec.decodeU64(row.key);
-    try std.testing.expectEqualSlices(u64, &[_]u64{ 10, 20, 30, 40 }, seen[0..n]);
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        try std.testing.expectEqual(@as(u64, 1), store.header.next_id);
+        try std.testing.expect(store.header.by_id_count >= 1);
+
+        var buf: [64]u8 = undefined;
+        const found = try store.tree("by_id").search(&codec.encodeU64(1), &buf);
+        try std.testing.expect(found != null);
+        try std.testing.expectEqualSlices(u8, "hello", found.?);
+    }
 }
 
-test "composite range scans the children of one parent" {
-    var store = TestStore.open(std.testing.allocator);
-    defer store.deinit();
+test "paged store: a split (moved) root survives flushHeader, reopen, and search" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const Key = codec.CompositeKey(&.{ "parent_id", "child_id" });
-    const tree = store.tree("by_parent_child");
-    try tree.put(&Key.encode(.{ 1, 100 }), "a");
-    try tree.put(&Key.encode(.{ 1, 200 }), "b");
-    try tree.put(&Key.encode(.{ 2, 50 }), "c");
+    const total: u64 = 2000;
+    var entry_count: u64 = undefined;
 
-    var children: usize = 0;
-    var it = tree.range(&Key.encode(.{ 1, 0 }), &Key.encode(.{ 2, 0 }));
-    while (it.next()) |_| children += 1;
-    try std.testing.expectEqual(@as(usize, 2), children);
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        const initial_root = store.tree("by_id").getRootPage();
+        var moved = false;
+        var i: u64 = 1;
+        while (i <= total) : (i += 1) {
+            try store.tree("by_id").insert(&codec.encodeU64(i), "v");
+            if (store.tree("by_id").getRootPage() != initial_root) moved = true;
+        }
+        try std.testing.expect(moved);
+
+        entry_count = store.tree("by_id").entryCount();
+        try store.flushHeader();
+    }
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        try std.testing.expectEqual(entry_count, store.tree("by_id").entryCount());
+
+        var buf: [64]u8 = undefined;
+        var i: u64 = 1;
+        while (i <= total) : (i += 1) {
+            const found = try store.tree("by_id").search(&codec.encodeU64(i), &buf);
+            try std.testing.expect(found != null);
+        }
+    }
+}
+
+test "paged store: memtable drain lands rows in the backing tree" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    try store.memtable("by_id").put(&codec.encodeU64(7), "seven");
+    try store.drainMemtables();
+
+    var buf: [64]u8 = undefined;
+    const found = try store.tree("by_id").search(&codec.encodeU64(7), &buf);
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualSlices(u8, "seven", found.?);
 }
 
 test "counters persist in the header and allocate from 1" {
-    var store = TestStore.open(std.testing.allocator);
-    defer store.deinit();
-    try std.testing.expectEqual(@as(u64, 1), store.nextId("next_id"));
-    try std.testing.expectEqual(@as(u64, 2), store.nextId("next_id"));
-    try std.testing.expectEqual(@as(u64, 0), store.header.next_seq);
-    try std.testing.expectEqual(@as(u64, 2), store.header.next_id);
-    store.counter("next_seq").* = 99;
-    try std.testing.expectEqual(@as(u64, 99), store.header.next_seq);
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+        try std.testing.expectEqual(@as(u64, 1), store.nextId("next_id"));
+        try std.testing.expectEqual(@as(u64, 2), store.nextId("next_id"));
+        store.counter("next_seq").* = 99;
+        try store.flushHeader();
+    }
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+        try std.testing.expectEqual(@as(u64, 2), store.header.next_id);
+        try std.testing.expectEqual(@as(u64, 99), store.header.next_seq);
+    }
+}
+
+const RecoverProbe = struct {
+    applied: usize = 0,
+    on_replayed_calls: usize = 0,
+    bootstrap_calls: usize = 0,
+
+    fn applyEntry(ctx: *anyopaque, entry: ReplayEntry) anyerror!void {
+        _ = entry;
+        const self: *RecoverProbe = @ptrCast(@alignCast(ctx));
+        self.applied += 1;
+    }
+    fn onReplayed(ctx: *anyopaque) anyerror!void {
+        const self: *RecoverProbe = @ptrCast(@alignCast(ctx));
+        self.on_replayed_calls += 1;
+    }
+    fn bootstrap(ctx: *anyopaque) anyerror!void {
+        const self: *RecoverProbe = @ptrCast(@alignCast(ctx));
+        self.bootstrap_calls += 1;
+    }
+};
+
+test "recover: applies each WAL entry once, replays-hook once, bootstraps only when empty" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    {
+        const op_code: u8 = 1;
+        var w = try wal.WalWriter.init(allocator, dir, 32);
+        defer w.deinit();
+        _ = try w.append(op_code, "one");
+        _ = try w.append(op_code, "two");
+        _ = try w.append(op_code, "three");
+        try w.sync();
+    }
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    var probe = RecoverProbe{};
+    try store.recover(&probe, .{
+        .apply_entry = RecoverProbe.applyEntry,
+        .on_replayed = RecoverProbe.onReplayed,
+        .bootstrap = RecoverProbe.bootstrap,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), probe.applied);
+    try std.testing.expectEqual(@as(usize, 1), probe.on_replayed_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.bootstrap_calls);
+}
+
+test "recover: cold start with no WAL applies nothing, replays once, bootstraps once" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    var probe = RecoverProbe{};
+    try store.recover(&probe, .{
+        .apply_entry = RecoverProbe.applyEntry,
+        .on_replayed = RecoverProbe.onReplayed,
+        .bootstrap = RecoverProbe.bootstrap,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), probe.applied);
+    try std.testing.expectEqual(@as(usize, 1), probe.on_replayed_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.bootstrap_calls);
+}
+
+const TickProbe = struct {
+    count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn tick(ctx: *anyopaque) anyerror!void {
+        const self: *TickProbe = @ptrCast(@alignCast(ctx));
+        _ = self.count.fetchAdd(1, .monotonic);
+    }
+};
+
+test "spawnWorker: ticks on the interval and stops cleanly without leaking" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    var probe = TickProbe{};
+    const worker = try store.spawnWorker(&probe, .{ .interval_ns = 1_000_000, .tick = TickProbe.tick });
+
+    while (probe.count.load(.monotonic) < 1) {
+        std.Thread.yield() catch {};
+    }
+    worker.stop();
+
+    try std.testing.expect(probe.count.load(.monotonic) >= 1);
 }

@@ -41,21 +41,24 @@ From that one declaration the engine generates, at comptime:
 
 ## Status
 
-This repository is the bootstrapped engine, validated end to end on **Zig 0.15.2**:
+A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (145 tests
+plus a `-Dcpu=baseline` build). Every layer is implemented:
 
 | Surface | State |
 |---|---|
 | `codec`: `FixedString`, `CompositeKey`, `encodeU64`/`decodeU64`, `Serializable`, `hash` | implemented |
 | `schema` / `Engine(schema)`: typed `Header`, named trees, persisted counters | implemented |
-| `OrderedTree`: point read/write/delete + ascending range scans | implemented (in-memory backing) |
-| Paged storage + WAL + snapshot + crash recovery | lands via the migration |
-| epoll reactor + binary-protocol framing/TLV + `run`/`ServerConfig` | lands via the migration |
-| reflection-driven TypeScript-client codegen (`tsgen`) | lands via the migration |
+| Paged storage (16 KB slotted pages, sharded LRU cache, on-page freelist) + a `[]const u8`-keyed B+Tree | implemented |
+| WAL durability + replay, memtables, bloom filter, snapshot/checkpoint, crash recovery | implemented |
+| `recover` / `spawnWorker` / seq-gated `commit` / `SnapshotHost` runtime seams | implemented |
+| epoll reactor + binary-protocol framing/TLV codec + `run` / `ServerConfig` | implemented |
+| reflection-driven TypeScript-client codegen (`tsgen`) | implemented |
 
-The public API surface is the contract the on-disk and networked layers attach behind without
-changing it: the comptime schema, the generated `Header`, the named-tree and counter accessors,
-and the `codec` toolkit. The full boundary, the hybrid API, and the ordered migration plan live
-in [`docs/design/zigstore-library-extraction-design.md`](docs/design/zigstore-library-extraction-design.md).
+`zigstore` was extracted from
+[`dmozdb`](https://github.com/poly-glot/zig-directory), which now consumes it as a
+`build.zig.zon` dependency and is its first production consumer. The boundary, the hybrid API,
+and the extraction design live in
+[`docs/design/zigstore-library-extraction-design.md`](docs/design/zigstore-library-extraction-design.md).
 
 ## Use it
 
@@ -86,22 +89,28 @@ zig fetch --save "https://github.com/poly-glot/zigstore/archive/refs/tags/v1.0.0
 ## API at a glance
 
 ```zig
-var store = Store.open(allocator);
+const Store = zigstore.Engine(schema);
+const store = try Store.init(allocator, .{ .data_dir = dir });   // heap-stable *Store
 defer store.deinit();
 
-const tree = store.tree("links_by_id");           // *OrderedTree, name checked at comptime
-try tree.put(&zigstore.codec.encodeU64(id), bytes);
-const value = tree.get(&zigstore.codec.encodeU64(id)); // ?[]const u8
+const tree = store.tree("links_by_id");           // *BPlusTree, name checked at comptime
+try tree.insert(&codec.encodeU64(id), bytes);     // upsert
 
-var it = tree.range(lo_key, hi_key);              // ascending [lo, hi); big-endian keys scan numerically
-while (it.next()) |row| { _ = row.key; _ = row.value; }
+var buf: [4096]u8 = undefined;
+const value = try tree.search(&codec.encodeU64(id), &buf); // !?[]const u8 (copied into buf)
+
+var it = try tree.rangeScan(lo_key, hi_key);      // ascending [lo, hi); big-endian keys scan numerically
+while (try it.next()) |row| { _ = row.key; _ = row.value; }
 
 const next = store.nextId("next_link_id");        // persisted counter, allocates from 1
-store.counter("next_link_id").* = 0;              // *u64 into the header
+store.counter("next_link_id").* = 0;              // *u64 into the header (single-writer)
+
+try store.drainMemtables();                       // flush the write memtables into the trees
 ```
 
-See [`examples/basic.zig`](examples/basic.zig) for a full directory-shaped store driven end to
-end.
+The dynamic seams stay runtime callbacks the consumer supplies: `store.recover(ctx, .{ .apply_entry, .on_replayed, .bootstrap })`, `store.spawnWorker(ctx, .{ .interval_ns, .tick })`, `zigstore.commit(Record, store, op_code, record, ctx, serialize_fn, apply_fn)`, snapshot over a `SnapshotHost`, `zigstore.protocol.processFrames(ctx, conn, dispatch_fn, op_latency, response_reserve)`, and `zigstore.run(Store, ctx, handler, config)`.
+
+See [`examples/basic.zig`](examples/basic.zig) for a full directory-shaped store driven end to end.
 
 ## Develop
 
@@ -114,9 +123,9 @@ zig build -Dcpu=baseline  # the Ampere/OKE baseline build
 zig fmt --check src/ examples/ build.zig
 ```
 
-The in-memory surface builds and tests on macOS and Linux alike. The on-disk WAL/file path
-(once it lands) needs Linux `O_DIRECT`/`fallocate`, so the canonical gate runs in the Linux
-devcontainer; CI runs it on Zig 0.15.2 plus a `-Dcpu=baseline` build.
+The paged storage uses Linux `O_DIRECT`/`fallocate`, so `zig build test` runs in the Linux
+devcontainer (or any Linux host with Zig 0.15.2); CI runs it on Zig 0.15.2 plus a
+`-Dcpu=baseline` build.
 
 ## Versioning
 
