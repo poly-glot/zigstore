@@ -166,11 +166,11 @@ pub const SnapshotManager = struct {
         const n = try file.readAll(&buf);
         if (n < SNAP_HEADER_SIZE) return null;
 
-        const snap: *const SnapshotHeader = @ptrCast(@alignCast(&buf));
+        const snap = std.mem.bytesToValue(SnapshotHeader, &buf);
 
         if (snap.magic != SNAP_MAGIC) return error.InvalidSnapshotMagic;
 
-        return snap.*;
+        return snap;
     }
 
     /// The WAL sequence the last snapshot is consistent up to, or 0 if none exists.

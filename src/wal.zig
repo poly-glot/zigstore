@@ -387,7 +387,7 @@ pub const WalWriter = struct {
             const hn = try file.readAll(&header_buf);
             if (hn < HEADER_SIZE) break;
 
-            const header: *const WalEntryHeader = @ptrCast(@alignCast(&header_buf));
+            const header = std.mem.bytesToValue(WalEntryHeader, &header_buf);
             if (header.sequence == 0) {
                 saw_padding = true;
                 break;
