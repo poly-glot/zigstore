@@ -9,14 +9,21 @@
 //!   - `codec`: the application-neutral byte-codec toolkit (`FixedString`, `CompositeKey`,
 //!     `encodeU64`/`decodeU64`, `Serializable`, `hash`).
 //!   - `wire_codec`: generic `@typeInfo`-driven struct/field marshalling for record encoding.
-//!   - `BPlusTree` / `MemTable`: the paged tree an index is built on (point ops + range scans)
-//!     and the write memtable fronting it.
+//!   - `BPlusTree` / `BTreeError` / `MemTable`: the paged tree an index is built on (point ops +
+//!     range scans), its error set, and the write memtable fronting it.
 //!   - `Config` / `Worker` / `ReplayEntry`: the per-store open config, the background-worker
 //!     handle, and one replayed WAL entry handed to a `recover` hook.
 //!   - `commit` / `snapshot` / `SnapshotHost`: the durable write path (serialize, WAL-append,
 //!     in-order apply, durability wait) over a caller-supplied record type, and point-in-time
 //!     snapshots driven through the `SnapshotHost` interface a `Store` satisfies via
 //!     `Store.snapshotHost()`.
+//!
+//!   - `BloomFilter`: the lock-free probabilistic set fronting a uniqueness check.
+//!   - `inverted_index`: the token-stream toolkit (`TokenIterator`, `MIN_TOKEN_LEN`,
+//!     `MAX_TOKEN_LEN`) a consumer drives to build its own search indexes.
+//!   - `signal`: the process-wide shutdown flag and SIGTERM/SIGINT installer.
+//!   - `MEMTABLE_SHARDS`: the fixed shard count of a `MemTable`, for callers that iterate its
+//!     shards directly when draining outside `Store.drainMemtables`.
 //!
 //!   - `protocol`: the application-neutral binary framing/TLV codec (`Status`, `writeResp`,
 //!     `parsePayload`, `writeRowList`, and the pipelined `processFrames` loop with an injected
@@ -42,6 +49,7 @@ pub const IndexSpec = engine.IndexSpec;
 pub const KeyKind = engine.KeyKind;
 pub const Engine = engine.Engine;
 pub const BPlusTree = engine.BPlusTree;
+pub const BTreeError = @import("btree/btree.zig").BTreeError;
 pub const MemTable = engine.MemTable;
 pub const ReplayEntry = engine.ReplayEntry;
 pub const Worker = engine.Worker;
@@ -55,6 +63,11 @@ pub const commit = @import("commit.zig").commit;
 pub const protocol = @import("protocol/framing.zig");
 pub const connection = @import("connection.zig");
 pub const histogram = @import("histogram.zig");
+
+pub const BloomFilter = @import("bloom.zig").BloomFilter;
+pub const inverted_index = @import("inverted_index.zig");
+pub const signal = @import("signal.zig");
+pub const MEMTABLE_SHARDS = @import("memtable.zig").NUM_SHARDS;
 pub const ServerConfig = @import("server_config.zig").ServerConfig;
 pub const EpollServer = @import("epoll.zig").EpollServer;
 pub const Handler = @import("epoll.zig").Handler;
