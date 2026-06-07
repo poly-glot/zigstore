@@ -11,8 +11,9 @@
 //!   - `wire_codec`: generic `@typeInfo`-driven struct/field marshalling for record encoding.
 //!   - `BPlusTree` / `BTreeError` / `MemTable`: the paged tree an index is built on (point ops +
 //!     range scans), its error set, and the write memtable fronting it.
-//!   - `Config` / `Worker` / `ReplayEntry`: the per-store open config, the background-worker
-//!     handle, and one replayed WAL entry handed to a `recover` hook.
+//!   - `Worker` / `ReplayEntry`: the background-worker handle and one replayed WAL entry handed
+//!     to a `recover` hook (`Store.Config` is the per-store open config, reached as a member of
+//!     the generated `Store`).
 //!   - `commit` / `snapshot` / `SnapshotHost`: the durable write path (serialize, WAL-append,
 //!     in-order apply, durability wait) over a caller-supplied record type, and point-in-time
 //!     snapshots driven through the `SnapshotHost` interface a `Store` satisfies via
@@ -27,7 +28,9 @@
 //!
 //!   - `protocol`: the application-neutral binary framing/TLV codec (`Status`, `writeResp`,
 //!     `parsePayload`, `writeRowList`, and the pipelined `processFrames` loop with an injected
-//!     raw-`op_byte` dispatch callback).
+//!     raw-`op_byte` dispatch callback and a caller-supplied `response_reserve`).
+//!   - `connection` / `histogram`: the per-connection request/response buffers a `Handler`
+//!     receives, and the latency-histogram type `processFrames` records op timings into.
 //!   - `ServerConfig` / `EpollServer` / `Handler` / `run`: the generic networked bootstrap — the
 //!     per-server config with its trust-list, the epoll reactor over an opaque `ctx` and runtime
 //!     `Handler`, and the `run` entry that spawns and joins the reactor pool.
@@ -58,6 +61,7 @@ pub const snapshot = @import("snapshot.zig");
 pub const SnapshotHost = snapshot.SnapshotHost;
 pub const SnapshotResult = snapshot.SnapshotResult;
 pub const SnapshotManager = snapshot.SnapshotManager;
+pub const forceSnapshot = snapshot.forceSnapshot;
 pub const commit = @import("commit.zig").commit;
 
 pub const protocol = @import("protocol/framing.zig");
