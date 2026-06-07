@@ -25,13 +25,16 @@
 //!     per-server config with its trust-list, the epoll reactor over an opaque `ctx` and runtime
 //!     `Handler`, and the `run` entry that spawns and joins the reactor pool.
 //!
-//! Still to attach: the reflection-driven TypeScript-client emitter. See the extraction
-//! design under `docs/`.
+//!   - `tsgen`: the reflection-driven TypeScript-client emitters (`writeStructInterface`,
+//!     `writeStructReader`, `writeOpEnum`, `writeStatusEnum`, `writeStatusMap`), parameterized
+//!     over a caller-supplied comptime `FieldTable` that decides each field's TS type and
+//!     decode expression. Names no application record.
 
 const engine = @import("engine.zig");
 
 pub const codec = @import("codec.zig");
 pub const wire_codec = @import("wire_codec.zig");
+pub const tsgen = @import("tsgen.zig");
 
 pub const schema = engine.schema;
 pub const Schema = engine.Schema;
@@ -61,6 +64,7 @@ test {
     _ = @import("codec.zig");
     _ = @import("engine.zig");
     _ = @import("wire_codec.zig");
+    _ = @import("tsgen.zig");
     _ = @import("file_header.zig");
 
     _ = @import("page.zig");
