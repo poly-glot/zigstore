@@ -52,6 +52,57 @@ pub fn forceSnapshot(host: SnapshotHost) !SnapshotResult {
     return .{ .wal_sequence = wal_seq, .duration_ms = duration_ms };
 }
 
+/// The on-disk name of the consistent `store.dat` copy `forceBaseBackup` produces.
+pub const BASE_BACKUP_FILE = "store.dat.base";
+
+/// Like `forceSnapshot`, but additionally copies `store.dat` to `store.dat.base` while the
+/// apply and drain locks are still held, so the copy is page-consistent at the returned WAL
+/// sequence (pages mutate in place — an unlocked copy could tear). Serves a replica base
+/// backup; the caller owns deleting the copy once consumed.
+pub fn forceBaseBackup(host: SnapshotHost) !SnapshotResult {
+    if (host.snapshot_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+        return error.SnapshotInProgress;
+    }
+    defer host.snapshot_in_progress.store(false, .release);
+
+    const start_ns = std.time.nanoTimestamp();
+
+    const wal_seq: u64 = host.walSequence(host.ctx);
+
+    var mgr = SnapshotManager.init(host.data_dir, 0);
+
+    {
+        host.apply_mutex.lock();
+        defer host.apply_mutex.unlock();
+        host.mt_drain_mutex.lock();
+        defer host.mt_drain_mutex.unlock();
+
+        try host.flushCache(host.ctx);
+        try host.flushHeader(host.ctx);
+        try copyStoreToBase(host.data_dir);
+    }
+
+    try mgr.writeMeta(host, wal_seq);
+
+    const end_ns = std.time.nanoTimestamp();
+    const duration_ms: u64 = @intCast(@divTrunc(end_ns - start_ns, std.time.ns_per_ms));
+    return .{ .wal_sequence = wal_seq, .duration_ms = duration_ms };
+}
+
+fn copyStoreToBase(data_dir: []const u8) !void {
+    const src = try std.fs.path.join(std.heap.page_allocator, &.{ data_dir, "store.dat" });
+    defer std.heap.page_allocator.free(src);
+
+    const dst = try std.fs.path.join(std.heap.page_allocator, &.{ data_dir, BASE_BACKUP_FILE });
+    defer std.heap.page_allocator.free(dst);
+
+    try std.fs.cwd().copyFile(src, std.fs.cwd(), dst, .{});
+
+    const copy = try std.fs.cwd().openFile(dst, .{ .mode = .read_write });
+    defer copy.close();
+    try copy.sync();
+}
+
 /// The `snapshot.meta` superblock: magic, version, the consistent WAL sequence, the wall-clock
 /// timestamp, the page count, and a pad to 64 bytes.
 pub const SnapshotHeader = extern struct {
@@ -108,6 +159,10 @@ pub const SnapshotManager = struct {
             try host.flushHeader(host.ctx);
         }
 
+        try self.writeMeta(host, wal_sequence);
+    }
+
+    fn writeMeta(self: *SnapshotManager, host: SnapshotHost, wal_sequence: u64) !void {
         const now = std.time.timestamp();
 
         const snap_header = SnapshotHeader{

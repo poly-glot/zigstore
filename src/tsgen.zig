@@ -35,6 +35,71 @@ pub fn writeStatusEnum(w: *std.Io.Writer, comptime name: []const u8, comptime E:
     try writeOpEnum(w, name, E);
 }
 
+/// Classification a `KindTable` assigns each op for the routed client: `read`
+/// ops may be served by a replica, `write` ops must reach the leader.
+pub const OpKind = enum { read, write };
+
+/// Emit `export const {name}: Record<number, "read" | "write"> = { ... }` over
+/// an op enum. The per-op classification comes from a caller-supplied comptime
+/// `KindTable` exposing:
+///
+///   pub fn kind(comptime E: type, comptime op_name: []const u8) OpKind
+///
+/// so this module names no application op. Feed the result to the router class
+/// `writeReadWriteRouter` emits.
+pub fn writeOpKindMap(
+    w: *std.Io.Writer,
+    comptime KindTable: type,
+    comptime name: []const u8,
+    comptime E: type,
+) !void {
+    try w.print("export const {s}: Record<number, \"read\" | \"write\"> = {{\n", .{name});
+    inline for (@typeInfo(E).@"enum".fields) |f| {
+        const kind = comptime KindTable.kind(E, f.name);
+        try w.print("    {d}: \"{s}\",\n", .{ f.value, @tagName(kind) });
+    }
+    try w.writeAll("};\n\n");
+}
+
+/// Emit the application-neutral routed client `{name}`: a class over two
+/// `Transport`s (leader and replica) that routes each op by its kind map.
+/// With `readYourWrites` enabled, reads fall back to the leader until the
+/// consumer reports (via `noteReplicaAppliedLsn`, fed from the replica's
+/// status/health op) that the replica has applied the session's last write LSN
+/// (recorded via `noteWriteLsn`). Unknown ops route to the leader.
+pub fn writeReadWriteRouter(w: *std.Io.Writer, comptime name: []const u8) !void {
+    try w.writeAll("export type Transport = (op: number, payload: Uint8Array) => Promise<Uint8Array>;\n\n");
+    try w.print("export class {s} {{\n", .{name});
+    try w.writeAll(
+        \\    private lastWriteLsn = 0n;
+        \\    private replicaAppliedLsn = 0n;
+        \\
+        \\    constructor(
+        \\        private readonly leader: Transport,
+        \\        private readonly replica: Transport,
+        \\        private readonly opKind: Record<number, "read" | "write">,
+        \\        private readonly readYourWrites: boolean = false,
+        \\    ) {}
+        \\
+        \\    noteWriteLsn(lsn: bigint): void {
+        \\        if (lsn > this.lastWriteLsn) this.lastWriteLsn = lsn;
+        \\    }
+        \\
+        \\    noteReplicaAppliedLsn(lsn: bigint): void {
+        \\        if (lsn > this.replicaAppliedLsn) this.replicaAppliedLsn = lsn;
+        \\    }
+        \\
+        \\    send(op: number, payload: Uint8Array): Promise<Uint8Array> {
+        \\        if (this.opKind[op] !== "read") return this.leader(op, payload);
+        \\        if (this.readYourWrites && this.replicaAppliedLsn < this.lastWriteLsn) return this.leader(op, payload);
+        \\        return this.replica(op, payload);
+        \\    }
+        \\}
+        \\
+        \\
+    );
+}
+
 /// Emit `export const {name}: Record<number, string> = { value: "human", ... }`
 /// over an enum, mapping each `snake_case` field name to a space-separated
 /// human-readable string.
@@ -247,4 +312,39 @@ test "writeStatusMap maps enum values to human-readable strings" {
     try std.testing.expect(std.mem.indexOf(u8, out, "export const STATUS_MSG: Record<number, string> = {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    1: \"not found\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    6: \"has children\",") != null);
+}
+
+const StubKindTable = struct {
+    pub fn kind(comptime E: type, comptime op_name: []const u8) OpKind {
+        _ = E;
+        if (std.mem.startsWith(u8, op_name, "get_") or std.mem.eql(u8, op_name, "ping")) return .read;
+        return .write;
+    }
+};
+
+test "writeOpKindMap classifies each op through the KindTable" {
+    const E = enum(u8) { create_link = 1, get_link = 3, ping = 255 };
+
+    var buf: [1024]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&buf);
+    try writeOpKindMap(&fw, StubKindTable, "OP_KIND", E);
+    const out = fw.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "export const OP_KIND: Record<number, \"read\" | \"write\"> = {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    1: \"write\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    3: \"read\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    255: \"read\",") != null);
+}
+
+test "writeReadWriteRouter emits the neutral routed client with the LSN fence" {
+    var buf: [4096]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&buf);
+    try writeReadWriteRouter(&fw, "RoutedClient");
+    const out = fw.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "export type Transport = (op: number, payload: Uint8Array) => Promise<Uint8Array>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export class RoutedClient {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "if (this.opKind[op] !== \"read\") return this.leader(op, payload);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "if (this.readYourWrites && this.replicaAppliedLsn < this.lastWriteLsn) return this.leader(op, payload);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return this.replica(op, payload);") != null);
 }

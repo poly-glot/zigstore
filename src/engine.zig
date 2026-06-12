@@ -22,6 +22,7 @@ const memtable = @import("memtable.zig");
 const wal = @import("wal.zig");
 const wal_replay = @import("wal_replay.zig");
 const snapshot = @import("snapshot.zig");
+const replication = @import("replication.zig");
 
 /// The paged B+Tree backing one index (point ops + range scans over byte keys/values).
 pub const BPlusTree = @import("btree/btree.zig").BPlusTree;
@@ -298,6 +299,9 @@ pub fn Engine(comptime s: Schema) type {
         last_applied_seq: u64,
         snapshot_in_progress: std.atomic.Value(bool),
 
+        read_only: std.atomic.Value(bool),
+        commit_gate: std.atomic.Value(?*replication.CommitGate),
+
         /// Open (or create) the store under `config.data_dir`, returning a heap-allocated
         /// `*Store` at a stable address. On a fresh directory the header is formatted with the
         /// schema's identity and every index starts at an empty (lazily-allocated) root; on an
@@ -349,7 +353,11 @@ pub fn Engine(comptime s: Schema) type {
             var cache = try page_cache.PageCache.init(allocator, file, cache_pages);
             errdefer cache.deinit();
 
-            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size) catch |err| blk: {
+            const snapshot_base = snapshot.SnapshotManager.getWalSequence(config.data_dir) catch |err| blk: {
+                log.warn("snapshot meta read failed: {} — WAL sequence resumes from 0", .{err});
+                break :blk 0;
+            };
+            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, snapshot_base) catch |err| blk: {
                 log.warn("WAL open failed: {} — continuing without WAL", .{err});
                 break :blk null;
             };
@@ -375,6 +383,8 @@ pub fn Engine(comptime s: Schema) type {
                 .apply_cond = .{},
                 .last_applied_seq = if (wal_writer) |w| w.sequence else 0,
                 .snapshot_in_progress = std.atomic.Value(bool).init(false),
+                .read_only = std.atomic.Value(bool).init(false),
+                .commit_gate = std.atomic.Value(?*replication.CommitGate).init(null),
             };
 
             inline for (s.indexes) |idx| {
@@ -600,6 +610,65 @@ pub fn Engine(comptime s: Schema) type {
             };
         }
 
+        /// Whether the store is a read-only replica (`commit` fails with
+        /// `error.ReadOnlyReplica` while set). Set by `Receiver.start` / `demote`, cleared
+        /// by `promote`.
+        pub fn isReadOnly(self: *Store) bool {
+            return self.read_only.load(.acquire);
+        }
+
+        /// Clears the read-only flag so the store accepts commits. Only call after the old
+        /// leader is fenced — the engine ships no election or fencing of its own.
+        pub fn promote(self: *Store) void {
+            self.read_only.store(false, .release);
+        }
+
+        /// Marks the store read-only; in-flight commits finish, new ones fail with
+        /// `error.ReadOnlyReplica`.
+        pub fn demote(self: *Store) void {
+            self.read_only.store(true, .release);
+        }
+
+        /// Installs (or clears with null) the quorum gate `commit` blocks on after
+        /// durability. Wire `Hub.commitGate()` here for synchronous replication.
+        pub fn setCommitGate(self: *Store, gate: ?*replication.CommitGate) void {
+            self.commit_gate.store(gate, .release);
+        }
+
+        /// The `replication.PrimaryHost` view of this store for `Hub.start`: its WAL
+        /// writer, data directory, and snapshot host (so the hub can serve base backups).
+        /// Fails with `error.WalDisabled` when the store opened without a WAL. The interior
+        /// WAL pointer is stable — the store is heap-allocated.
+        pub fn primaryHost(self: *Store) !replication.PrimaryHost {
+            if (self.wal_writer == null) return error.WalDisabled;
+            return .{
+                .wal = &self.wal_writer.?,
+                .data_dir = self.config.data_dir,
+                .snapshot_host = self.snapshotHost(),
+            };
+        }
+
+        /// The `replication.ReplicaHost` view of this store for `Receiver.start`: the WAL
+        /// writer, the apply-ordering state, the read-only flag, and the consumer's
+        /// `apply_entry` hook (same shape as `recover`'s). Fails with `error.WalDisabled`
+        /// when the store opened without a WAL.
+        pub fn replicaHost(
+            self: *Store,
+            ctx: *anyopaque,
+            apply_entry: *const fn (ctx: *anyopaque, entry: ReplayEntry) anyerror!void,
+        ) !replication.ReplicaHost {
+            if (self.wal_writer == null) return error.WalDisabled;
+            return .{
+                .wal = &self.wal_writer.?,
+                .apply_mutex = &self.apply_mutex,
+                .apply_cond = &self.apply_cond,
+                .last_applied_seq = &self.last_applied_seq,
+                .read_only = &self.read_only,
+                .ctx = ctx,
+                .apply_entry = apply_entry,
+            };
+        }
+
         fn snapshotWalSequence(ctx: *anyopaque) u64 {
             const self: *Store = @ptrCast(@alignCast(ctx));
             return if (self.wal_writer) |*w| w.getSequence() else 0;
@@ -816,7 +885,7 @@ test "recover: applies each WAL entry once, replays-hook once, bootstraps only w
 
     {
         const op_code: u8 = 1;
-        var w = try wal.WalWriter.init(allocator, dir, 32);
+        var w = try wal.WalWriter.init(allocator, dir, 32, 0);
         defer w.deinit();
         _ = try w.append(op_code, "one");
         _ = try w.append(op_code, "two");
@@ -885,4 +954,30 @@ test "spawnWorker: ticks on the interval and stops cleanly without leaking" {
     worker.stop();
 
     try std.testing.expect(probe.count.load(.monotonic) >= 1);
+}
+
+test "reopen resumes the WAL sequence from snapshot metadata after truncation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        const w = &store.wal_writer.?;
+        _ = try w.append(1, "a");
+        _ = try w.append(1, "b");
+        _ = try w.append(1, "c");
+        try w.sync();
+
+        _ = try snapshot.forceSnapshot(store.snapshotHost());
+        try w.truncateAfterCheckpoint();
+    }
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+        try std.testing.expectEqual(@as(u64, 3), store.wal_writer.?.getSequence());
+    }
 }
