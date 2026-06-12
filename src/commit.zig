@@ -15,7 +15,10 @@ const std = @import("std");
 /// receives the caller's opaque `ctx` — the application context the engine never names — and
 /// applies the record while the apply mutex is held, after every lower-sequence commit has
 /// applied, so the in-memory state mutates in exact WAL order. Fails with `error.WalDisabled` if
-/// the store has no WAL writer.
+/// the store has no WAL writer, and with `error.ReadOnlyReplica` on a demoted store (only the
+/// replication receiver writes a replica's WAL). When a `CommitGate` is set on the store,
+/// returns only after the configured quorum of followers has acked the entry durable, or fails
+/// with `error.ReplicationStopped` once replication shuts down.
 pub fn commit(
     comptime Record: type,
     store: anytype,
@@ -25,6 +28,8 @@ pub fn commit(
     serialize_fn: *const fn (std.mem.Allocator, Record) anyerror![]u8,
     apply_fn: *const fn (ctx: *anyopaque, Record) anyerror!void,
 ) !void {
+    if (store.read_only.load(.acquire)) return error.ReadOnlyReplica;
+
     const encoded = try serialize_fn(store.allocator, record);
     defer store.allocator.free(encoded);
 
@@ -49,6 +54,10 @@ pub fn commit(
 
     if (store.wal_writer) |*w| {
         try w.awaitDurable(seq);
+    }
+
+    if (store.commit_gate.load(.acquire)) |gate| {
+        try gate.awaitQuorum(seq);
     }
 }
 

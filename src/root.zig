@@ -14,6 +14,9 @@
 //!   - `Worker` / `ReplayEntry`: the background-worker handle and one replayed WAL entry handed
 //!     to a `recover` hook (`Store.Config` is the per-store open config, reached as a member of
 //!     the generated `Store`).
+//!   - `HealthStatus`: the engine-owned facts (`read_only`, applied/durable LSNs) a consumer's
+//!     health/ping op serves for k8s liveness and replica-lag readiness, via
+//!     `Store.healthStatus()`.
 //!   - `commit` / `snapshot` / `SnapshotHost`: the durable write path (serialize, WAL-append,
 //!     in-order apply, durability wait) over a caller-supplied record type, and point-in-time
 //!     snapshots driven through the `SnapshotHost` interface a `Store` satisfies via
@@ -35,8 +38,16 @@
 //!     per-server config with its trust-list, the epoll reactor over an opaque `ctx` and runtime
 //!     `Handler`, and the `run` entry that spawns and joins the reactor pool.
 //!
+//!   - `replication`: streaming-standby replication — the leader-side `Hub` (durable WAL
+//!     streaming, acks, retain floor, optional `CommitGate` quorum), the follower-side
+//!     `Receiver` (append + apply + ack, reconnect, promotion-ready phases), and the
+//!     `PrimaryHost`/`ReplicaHost` seams a `Store` satisfies via `primaryHost()`/`replicaHost()`.
+//!
 //!   - `tsgen`: the reflection-driven TypeScript-client emitters (`writeStructInterface`,
-//!     `writeStructReader`, `writeOpEnum`, `writeStatusEnum`, `writeStatusMap`), parameterized
+//!     `writeStructReader`, `writeOpEnum`, `writeStatusEnum`, `writeStatusMap`, plus the
+//!     read/write split: `writeOpKindMap` over a caller-supplied `KindTable` and the
+//!     `writeReadWriteRouter` leader/replica router with its read-your-writes LSN fence),
+//!     parameterized
 //!     over a caller-supplied comptime `FieldTable` that decides each field's TS type and
 //!     decode expression. Names no application record.
 
@@ -56,6 +67,7 @@ pub const BTreeError = @import("btree/btree.zig").BTreeError;
 pub const MemTable = engine.MemTable;
 pub const ReplayEntry = engine.ReplayEntry;
 pub const Worker = engine.Worker;
+pub const HealthStatus = engine.HealthStatus;
 
 pub const snapshot = @import("snapshot.zig");
 pub const SnapshotHost = snapshot.SnapshotHost;
@@ -63,6 +75,7 @@ pub const SnapshotResult = snapshot.SnapshotResult;
 pub const SnapshotManager = snapshot.SnapshotManager;
 pub const forceSnapshot = snapshot.forceSnapshot;
 pub const commit = @import("commit.zig").commit;
+pub const replication = @import("replication.zig");
 
 pub const protocol = @import("protocol/framing.zig");
 pub const connection = @import("connection.zig");
@@ -100,6 +113,8 @@ test {
 
     _ = @import("wal.zig");
     _ = @import("wal_replay.zig");
+    _ = @import("wal_follow.zig");
+    _ = @import("replication.zig");
     _ = @import("snapshot.zig");
     _ = @import("commit.zig");
 

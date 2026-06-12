@@ -22,6 +22,7 @@ const memtable = @import("memtable.zig");
 const wal = @import("wal.zig");
 const wal_replay = @import("wal_replay.zig");
 const snapshot = @import("snapshot.zig");
+const replication = @import("replication.zig");
 
 /// The paged B+Tree backing one index (point ops + range scans over byte keys/values).
 pub const BPlusTree = @import("btree/btree.zig").BPlusTree;
@@ -33,6 +34,16 @@ const MEMTABLE_SHARDS = memtable.NUM_SHARDS;
 
 /// One replayed WAL entry handed to a `recover` hook: its sequence, op code, and payload bytes.
 pub const ReplayEntry = wal_replay.ReplayEntry;
+
+/// What `Store.healthStatus` reports — the engine-owned facts a consumer's health/ping op
+/// serves for liveness and readiness probes. A replica's readiness is typically
+/// `!read_only or (leader durable LSN - last_applied_lsn) <= lag budget`, with the leader
+/// LSN taken from `replication.Receiver.status()`.
+pub const HealthStatus = struct {
+    read_only: bool,
+    last_applied_lsn: u64,
+    durable_lsn: u64,
+};
 
 const log = std.log.scoped(.engine);
 
@@ -298,6 +309,11 @@ pub fn Engine(comptime s: Schema) type {
         last_applied_seq: u64,
         snapshot_in_progress: std.atomic.Value(bool),
 
+        read_only: std.atomic.Value(bool),
+        replica_streaming: std.atomic.Value(bool),
+        commit_gate: std.atomic.Value(?*replication.CommitGate),
+        sync_gate: replication.CommitGate,
+
         /// Open (or create) the store under `config.data_dir`, returning a heap-allocated
         /// `*Store` at a stable address. On a fresh directory the header is formatted with the
         /// schema's identity and every index starts at an empty (lazily-allocated) root; on an
@@ -349,7 +365,11 @@ pub fn Engine(comptime s: Schema) type {
             var cache = try page_cache.PageCache.init(allocator, file, cache_pages);
             errdefer cache.deinit();
 
-            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size) catch |err| blk: {
+            const snapshot_base = snapshot.SnapshotManager.getWalSequence(config.data_dir) catch |err| blk: {
+                log.warn("snapshot meta read failed: {} — WAL sequence resumes from 0", .{err});
+                break :blk 0;
+            };
+            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, snapshot_base) catch |err| blk: {
                 log.warn("WAL open failed: {} — continuing without WAL", .{err});
                 break :blk null;
             };
@@ -375,6 +395,10 @@ pub fn Engine(comptime s: Schema) type {
                 .apply_cond = .{},
                 .last_applied_seq = if (wal_writer) |w| w.sequence else 0,
                 .snapshot_in_progress = std.atomic.Value(bool).init(false),
+                .read_only = std.atomic.Value(bool).init(false),
+                .replica_streaming = std.atomic.Value(bool).init(false),
+                .commit_gate = std.atomic.Value(?*replication.CommitGate).init(null),
+                .sync_gate = .{},
             };
 
             inline for (s.indexes) |idx| {
@@ -600,6 +624,95 @@ pub fn Engine(comptime s: Schema) type {
             };
         }
 
+        /// Whether the store is a read-only replica (`commit` fails with
+        /// `error.ReadOnlyReplica` while set). Set by `Receiver.start` / `demote`, cleared
+        /// by `promote`.
+        pub fn isReadOnly(self: *Store) bool {
+            return self.read_only.load(.acquire);
+        }
+
+        /// The engine-owned health facts for a consumer's health/ping op: the read-only
+        /// flag, the last applied WAL sequence, and the last durable WAL sequence (0 when
+        /// the store runs without a WAL). Cheap enough for a readiness probe path.
+        pub fn healthStatus(self: *Store) HealthStatus {
+            self.apply_mutex.lock();
+            const applied = self.last_applied_seq;
+            self.apply_mutex.unlock();
+
+            return .{
+                .read_only = self.read_only.load(.acquire),
+                .last_applied_lsn = applied,
+                .durable_lsn = if (self.wal_writer) |*w| w.durableBoundary().sequence else 0,
+            };
+        }
+
+        /// Clears the read-only flag so the store accepts commits. Fails with
+        /// `error.ReplicaStillStreaming` while a `Receiver` is attached and live — stop the
+        /// receiver first, so a local commit can never interleave with streamed appends in
+        /// the same WAL. Only call after the old leader is fenced — the engine ships no
+        /// election or fencing of its own.
+        pub fn promote(self: *Store) !void {
+            if (self.replica_streaming.load(.acquire)) return error.ReplicaStillStreaming;
+            self.read_only.store(false, .release);
+        }
+
+        /// Marks the store read-only; in-flight commits finish, new ones fail with
+        /// `error.ReadOnlyReplica`.
+        pub fn demote(self: *Store) void {
+            self.read_only.store(true, .release);
+        }
+
+        /// Installs (or clears with null) the quorum gate `commit` blocks on after
+        /// durability. For synchronous replication pass `syncGate()` here and in
+        /// `HubConfig.commit_gate`.
+        pub fn setCommitGate(self: *Store, gate: ?*replication.CommitGate) void {
+            self.commit_gate.store(gate, .release);
+        }
+
+        /// The store-owned quorum gate. Its lifetime is the store's, so a commit can never
+        /// outlive it the way it could a hub-owned gate: wire it into both
+        /// `HubConfig.commit_gate` (the hub advances and closes it) and `setCommitGate`
+        /// (commits wait on it). After `Hub.stop`, waiting commits fail with
+        /// `error.ReplicationStopped`; a new hub re-arms the gate.
+        pub fn syncGate(self: *Store) *replication.CommitGate {
+            return &self.sync_gate;
+        }
+
+        /// The `replication.PrimaryHost` view of this store for `Hub.start`: its WAL
+        /// writer, data directory, and snapshot host (so the hub can serve base backups).
+        /// Fails with `error.WalDisabled` when the store opened without a WAL. The interior
+        /// WAL pointer is stable — the store is heap-allocated.
+        pub fn primaryHost(self: *Store) !replication.PrimaryHost {
+            if (self.wal_writer == null) return error.WalDisabled;
+            return .{
+                .wal = &self.wal_writer.?,
+                .data_dir = self.config.data_dir,
+                .snapshot_host = self.snapshotHost(),
+            };
+        }
+
+        /// The `replication.ReplicaHost` view of this store for `Receiver.start`: the WAL
+        /// writer, the apply-ordering state, the read-only flag, and the consumer's
+        /// `apply_entry` hook (same shape as `recover`'s). Fails with `error.WalDisabled`
+        /// when the store opened without a WAL.
+        pub fn replicaHost(
+            self: *Store,
+            ctx: *anyopaque,
+            apply_entry: *const fn (ctx: *anyopaque, entry: ReplayEntry) anyerror!void,
+        ) !replication.ReplicaHost {
+            if (self.wal_writer == null) return error.WalDisabled;
+            return .{
+                .wal = &self.wal_writer.?,
+                .apply_mutex = &self.apply_mutex,
+                .apply_cond = &self.apply_cond,
+                .last_applied_seq = &self.last_applied_seq,
+                .read_only = &self.read_only,
+                .streaming = &self.replica_streaming,
+                .ctx = ctx,
+                .apply_entry = apply_entry,
+            };
+        }
+
         fn snapshotWalSequence(ctx: *anyopaque) u64 {
             const self: *Store = @ptrCast(@alignCast(ctx));
             return if (self.wal_writer) |*w| w.getSequence() else 0;
@@ -816,7 +929,7 @@ test "recover: applies each WAL entry once, replays-hook once, bootstraps only w
 
     {
         const op_code: u8 = 1;
-        var w = try wal.WalWriter.init(allocator, dir, 32);
+        var w = try wal.WalWriter.init(allocator, dir, 32, 0);
         defer w.deinit();
         _ = try w.append(op_code, "one");
         _ = try w.append(op_code, "two");
@@ -885,4 +998,54 @@ test "spawnWorker: ticks on the interval and stops cleanly without leaking" {
     worker.stop();
 
     try std.testing.expect(probe.count.load(.monotonic) >= 1);
+}
+
+test "reopen resumes the WAL sequence from snapshot metadata after truncation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        const w = &store.wal_writer.?;
+        _ = try w.append(1, "a");
+        _ = try w.append(1, "b");
+        _ = try w.append(1, "c");
+        try w.sync();
+
+        _ = try snapshot.forceSnapshot(store.snapshotHost());
+        try w.truncateAfterCheckpoint();
+    }
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+        try std.testing.expectEqual(@as(u64, 3), store.wal_writer.?.getSequence());
+    }
+}
+
+test "healthStatus reports the read-only flag and applied/durable LSNs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    const fresh = store.healthStatus();
+    try std.testing.expect(!fresh.read_only);
+    try std.testing.expectEqual(@as(u64, 0), fresh.last_applied_lsn);
+    try std.testing.expectEqual(@as(u64, 0), fresh.durable_lsn);
+
+    const w = &store.wal_writer.?;
+    _ = try w.append(1, "a");
+    _ = try w.append(1, "b");
+    try w.sync();
+
+    store.demote();
+    const demoted = store.healthStatus();
+    try std.testing.expect(demoted.read_only);
+    try std.testing.expectEqual(@as(u64, 2), demoted.durable_lsn);
 }
