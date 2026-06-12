@@ -5,9 +5,10 @@
 //!
 //! The engine ships mechanism only. Leader election and fencing belong to the consumer
 //! (e.g. a Kubernetes Lease): fence the old leader before calling `promote` on a replica.
-//! Synchronous replication is opt-in via `CommitGate` — wire `Hub.commitGate()` into the
-//! store with `setCommitGate` and set `sync_standbys > 0`, and `commit` blocks until the
-//! quorum of followers has acked the entry durable.
+//! Synchronous replication is opt-in via the store-owned `CommitGate` — pass
+//! `Store.syncGate()` to both `HubConfig.commit_gate` and `Store.setCommitGate` and set
+//! `sync_standbys > 0`, and `commit` blocks until the quorum of followers has acked the
+//! entry durable.
 
 const std = @import("std");
 const posix = std.posix;
@@ -82,7 +83,9 @@ const STOP_POLL_NS: u64 = 20 * std.time.ns_per_ms;
 
 /// Quorum watermark for synchronous replication. `commit` blocks in `awaitQuorum` until the
 /// hub advances the watermark past the entry's LSN, or fails with
-/// `error.ReplicationStopped` once the hub closes the gate.
+/// `error.ReplicationStopped` once the hub closes the gate. The gate's memory is owned by
+/// the caller, not the hub — a generated store provides one with a store-long lifetime via
+/// `Store.syncGate()` — so commits can never touch a freed gate, even after `Hub.stop`.
 pub const CommitGate = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
@@ -99,12 +102,21 @@ pub const CommitGate = struct {
         }
     }
 
-    /// Permanently releases all current and future waiters with `error.ReplicationStopped`.
+    /// Releases all current and future waiters with `error.ReplicationStopped`, until
+    /// `reopen`.
     pub fn close(self: *CommitGate) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.closed = true;
         self.cond.broadcast();
+    }
+
+    /// Re-arms a gate a previous hub closed; the watermark persists (LSNs are monotonic
+    /// across hubs on the same store). Called by `Hub.start`.
+    pub fn reopen(self: *CommitGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = false;
     }
 
     /// Blocks until the watermark reaches `lsn`; fails once the gate is closed.
@@ -135,25 +147,31 @@ pub const PrimaryHost = struct {
 };
 
 /// The follower-side seam a `Receiver` applies through: the replica's WAL writer, the
-/// store's apply ordering state, the read-only flag, and the consumer's apply hook (the
-/// same shape `recover` takes). Obtain one via `Store.replicaHost(ctx, apply_entry)`.
+/// store's apply ordering state, the read-only and streaming flags, and the consumer's
+/// apply hook (the same shape `recover` takes). Obtain one via
+/// `Store.replicaHost(ctx, apply_entry)`. `streaming` is held true for the receiver's
+/// lifetime so the store's `promote` can refuse while streamed appends are still possible.
 pub const ReplicaHost = struct {
     wal: *wal.WalWriter,
     apply_mutex: *std.Thread.Mutex,
     apply_cond: *std.Thread.Condition,
     last_applied_seq: *u64,
     read_only: *std.atomic.Value(bool),
+    streaming: *std.atomic.Value(bool),
     ctx: *anyopaque,
     apply_entry: *const fn (ctx: *anyopaque, entry: wal_replay.ReplayEntry) anyerror!void,
 };
 
 /// Leader listener configuration. `port = 0` binds an ephemeral port (read it back via
-/// `Hub.port()`). `sync_standbys = 0` keeps replication asynchronous; `n > 0` advances the
-/// `CommitGate` to the n-th highest follower durable ack.
+/// `Hub.port()`). `sync_standbys = 0` keeps replication asynchronous; `n > 0` advances
+/// `commit_gate` to the n-th highest follower durable ack. The gate pointer must outlive
+/// the hub — pass `Store.syncGate()` (store-owned) and wire the same pointer into
+/// `Store.setCommitGate` to make commits wait on it.
 pub const HubConfig = struct {
     bind_address: [4]u8 = .{ 0, 0, 0, 0 },
     port: u16 = 0,
     sync_standbys: u8 = 0,
+    commit_gate: ?*CommitGate = null,
     max_followers: u8 = 8,
     heartbeat_interval_ms: u64 = 1000,
     ack_timeout_ms: u64 = 10_000,
@@ -181,7 +199,7 @@ pub const Hub = struct {
     allocator: std.mem.Allocator,
     host: PrimaryHost,
     cfg: HubConfig,
-    gate: CommitGate,
+    gate: ?*CommitGate,
     listener_fd: posix.socket_t,
     bound_port: u16,
     shutdown: std.atomic.Value(bool),
@@ -205,11 +223,13 @@ pub const Hub = struct {
         const self = try allocator.create(Hub);
         errdefer allocator.destroy(self);
 
+        if (cfg.commit_gate) |gate| gate.reopen();
+
         self.* = Hub{
             .allocator = allocator,
             .host = host,
             .cfg = cfg,
-            .gate = .{},
+            .gate = cfg.commit_gate,
             .listener_fd = server.stream.handle,
             .bound_port = server.listen_address.getPort(),
             .shutdown = std.atomic.Value(bool).init(false),
@@ -229,7 +249,7 @@ pub const Hub = struct {
     /// retain floor, and frees the hub. The pointer is invalid afterward.
     pub fn stop(self: *Hub) void {
         self.shutdown.store(true, .release);
-        self.gate.close();
+        if (self.gate) |gate| gate.close();
 
         posix.shutdown(self.listener_fd, .both) catch {};
         self.accept_thread.join();
@@ -268,11 +288,6 @@ pub const Hub = struct {
         return self.bound_port;
     }
 
-    /// The hub's quorum gate, for `Store.setCommitGate`.
-    pub fn commitGate(self: *Hub) *CommitGate {
-        return &self.gate;
-    }
-
     /// Snapshot of leader durability, the quorum watermark, and per-follower acks (up to
     /// `out.len` entries).
     pub fn status(self: *Hub, out: []FollowerStatus) HubStatus {
@@ -295,7 +310,7 @@ pub const Hub = struct {
 
         return .{
             .durable_lsn = self.host.wal.durableBoundary().sequence,
-            .quorum_lsn = self.gate.current(),
+            .quorum_lsn = if (self.gate) |gate| gate.current() else 0,
             .follower_count = count,
         };
     }
@@ -329,7 +344,7 @@ pub const Hub = struct {
             const t = std.Thread.spawn(.{}, serveBackupThread, .{ self, fd }) catch |err| {
                 self.backup_wg.finish();
                 log.err("replication: backup thread spawn failed: {}", .{err});
-                self.respond(fd, .rejected, 0);
+                respond(fd, .rejected, 0);
                 posix.close(fd);
                 return;
             };
@@ -341,19 +356,19 @@ pub const Hub = struct {
         const verdict = self.judgeHandshake(req, boundary);
 
         if (verdict != .accepted) {
-            self.respond(fd, verdict, boundary.sequence);
+            respond(fd, verdict, boundary.sequence);
             posix.close(fd);
             return;
         }
 
         const follower = self.register(fd, req) catch |err| {
             log.warn("replication: rejecting follower: {}", .{err});
-            self.respond(fd, .rejected, boundary.sequence);
+            respond(fd, .rejected, boundary.sequence);
             posix.close(fd);
             return;
         };
 
-        self.respond(fd, .accepted, boundary.sequence);
+        respond(fd, .accepted, boundary.sequence);
         setSockTimeout(fd, posix.SO.RCVTIMEO, self.cfg.ack_timeout_ms);
 
         follower.ack_thread = std.Thread.spawn(.{}, Follower.ackLoop, .{follower}) catch |err| {
@@ -376,7 +391,7 @@ pub const Hub = struct {
         defer posix.close(fd);
 
         const shost = self.host.snapshot_host orelse {
-            self.respond(fd, .rejected, 0);
+            respond(fd, .rejected, 0);
             return;
         };
 
@@ -385,11 +400,11 @@ pub const Hub = struct {
 
         const result = snapshot.forceBaseBackup(shost) catch |err| {
             log.warn("replication: base backup failed: {}", .{err});
-            self.respond(fd, .rejected, 0);
+            respond(fd, .rejected, 0);
             return;
         };
 
-        self.respond(fd, .accepted, result.wal_sequence);
+        respond(fd, .accepted, result.wal_sequence);
 
         self.streamBackupFiles(fd) catch |err| {
             log.warn("replication: base backup transfer failed: {}", .{err});
@@ -425,8 +440,7 @@ pub const Hub = struct {
         return .accepted;
     }
 
-    fn respond(self: *Hub, fd: posix.socket_t, verdict: HandshakeStatus, durable_lsn: u64) void {
-        _ = self;
+    fn respond(fd: posix.socket_t, verdict: HandshakeStatus, durable_lsn: u64) void {
         const resp = HandshakeResponse{
             .magic = HANDSHAKE_MAGIC,
             .status = @intFromEnum(verdict),
@@ -514,9 +528,11 @@ pub const Hub = struct {
 
         self.host.wal.setRetainFloor(floor);
 
-        if (self.cfg.sync_standbys > 0 and n >= self.cfg.sync_standbys) {
-            std.mem.sort(u64, acks[0..n], {}, std.sort.desc(u64));
-            self.gate.advance(acks[self.cfg.sync_standbys - 1]);
+        if (self.gate) |gate| {
+            if (self.cfg.sync_standbys > 0 and n >= self.cfg.sync_standbys) {
+                std.mem.sort(u64, acks[0..n], {}, std.sort.desc(u64));
+                gate.advance(acks[self.cfg.sync_standbys - 1]);
+            }
         }
     }
 };
@@ -608,10 +624,10 @@ const Follower = struct {
             defer self.hub.followers_mutex.unlock();
             self.done.store(true, .release);
             posix.close(self.fd);
+            self.hub.recomputeLocked();
         }
 
         self.reader.deinit();
-        self.hub.recompute();
     }
 };
 
@@ -668,12 +684,11 @@ pub const Receiver = struct {
     /// Marks the replica read-only, spawns the supervisor thread, and returns the
     /// heap-allocated receiver. Release with `stop`.
     pub fn start(allocator: std.mem.Allocator, host: ReplicaHost, cfg: ReceiverConfig) !*Receiver {
-        if (cfg.replica_name.len > REPLICA_NAME_LEN) return error.ReplicaNameTooLong;
-
-        var name: [REPLICA_NAME_LEN]u8 = .{0} ** REPLICA_NAME_LEN;
-        @memcpy(name[0..cfg.replica_name.len], cfg.replica_name);
+        const name = try buildReplicaName(cfg.replica_name);
 
         host.read_only.store(true, .release);
+        host.streaming.store(true, .release);
+        errdefer host.streaming.store(false, .release);
 
         const start_seq = host.wal.getSequence();
 
@@ -726,6 +741,8 @@ pub const Receiver = struct {
     }
 
     fn supervise(self: *Receiver) void {
+        defer self.host.streaming.store(false, .release);
+
         const address = std.net.Address.initIp4(self.cfg.leader_address, self.cfg.leader_port);
         var backoff = self.cfg.reconnect_min_ms;
 
@@ -770,8 +787,7 @@ pub const Receiver = struct {
     }
 
     fn session(self: *Receiver, fd: posix.socket_t) !void {
-        setSockTimeout(fd, posix.SO.RCVTIMEO, self.cfg.ack_timeout_ms);
-        setSockTimeout(fd, posix.SO.SNDTIMEO, self.cfg.ack_timeout_ms);
+        setSockTimeouts(fd, self.cfg.ack_timeout_ms);
 
         const req = HandshakeRequest{
             .magic = HANDSHAKE_MAGIC,
@@ -904,16 +920,12 @@ pub const BaseBackupInfo = struct {
 /// store open on `data_dir`; opening the store afterwards resumes the WAL sequence from the
 /// snapshot metadata, so a `Receiver.start` continues streaming exactly past the base.
 pub fn fetchBaseBackup(allocator: std.mem.Allocator, cfg: ReceiverConfig, data_dir: []const u8) !BaseBackupInfo {
-    if (cfg.replica_name.len > REPLICA_NAME_LEN) return error.ReplicaNameTooLong;
-
-    var name: [REPLICA_NAME_LEN]u8 = .{0} ** REPLICA_NAME_LEN;
-    @memcpy(name[0..cfg.replica_name.len], cfg.replica_name);
+    const name = try buildReplicaName(cfg.replica_name);
 
     const address = std.net.Address.initIp4(cfg.leader_address, cfg.leader_port);
     const stream = try std.net.tcpConnectToAddress(address);
     defer stream.close();
-    setSockTimeout(stream.handle, posix.SO.RCVTIMEO, cfg.ack_timeout_ms);
-    setSockTimeout(stream.handle, posix.SO.SNDTIMEO, cfg.ack_timeout_ms);
+    setSockTimeouts(stream.handle, cfg.ack_timeout_ms);
 
     const req = HandshakeRequest{
         .magic = BACKUP_MAGIC,
@@ -984,14 +996,18 @@ fn writeCrc(fd: posix.socket_t, value: u32) !void {
     try writeFull(fd, &crc_buf);
 }
 
+fn writeLen(fd: posix.socket_t, len: u64) !void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, len, .little);
+    try writeFull(fd, &len_buf);
+}
+
 fn sendFile(fd: posix.socket_t, path: []const u8) !void {
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
     defer file.close();
 
     const size = (try file.stat()).size;
-    var len_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &len_buf, size, .little);
-    try writeFull(fd, &len_buf);
+    try writeLen(fd, size);
 
     var crc = std.hash.crc.Crc32.init();
     var chunk: [64 * 1024]u8 = undefined;
@@ -1034,6 +1050,18 @@ fn setSockTimeout(fd: posix.socket_t, opt: u32, ms: u64) void {
         .usec = @intCast((ms % 1000) * 1000),
     };
     posix.setsockopt(fd, posix.SOL.SOCKET, opt, std.mem.asBytes(&tv)) catch {};
+}
+
+fn setSockTimeouts(fd: posix.socket_t, ms: u64) void {
+    setSockTimeout(fd, posix.SO.RCVTIMEO, ms);
+    setSockTimeout(fd, posix.SO.SNDTIMEO, ms);
+}
+
+fn buildReplicaName(replica_name: []const u8) error{ReplicaNameTooLong}![REPLICA_NAME_LEN]u8 {
+    if (replica_name.len > REPLICA_NAME_LEN) return error.ReplicaNameTooLong;
+    var name: [REPLICA_NAME_LEN]u8 = .{0} ** REPLICA_NAME_LEN;
+    @memcpy(name[0..replica_name.len], replica_name);
+    return name;
 }
 
 fn writeFull(fd: posix.socket_t, bytes: []const u8) !void {
@@ -1199,7 +1227,7 @@ test "commit on a read-only replica fails with ReadOnlyReplica" {
     store.demote();
     try std.testing.expectError(error.ReadOnlyReplica, commitTestRecord(store, 1, 1));
 
-    store.promote();
+    try store.promote();
     try commitTestRecord(store, 1, 1);
 }
 
@@ -1230,7 +1258,7 @@ test "promotion: a caught-up follower accepts commits with a continuing LSN" {
     };
 
     recv.stop();
-    follower.promote();
+    try follower.promote();
 
     try commitTestRecord(follower, 100, 42);
     try std.testing.expectEqual(total + 1, follower.wal_writer.?.getSequence());
@@ -1245,9 +1273,12 @@ test "sync_standbys=1: commit blocks until a follower acks through the gate" {
 
     const leader = try openStore(allocator, &tmp_leader);
     defer closeStore(leader);
-    const hub = try Hub.start(allocator, try leader.primaryHost(), .{ .sync_standbys = 1 });
+    const hub = try Hub.start(allocator, try leader.primaryHost(), .{
+        .sync_standbys = 1,
+        .commit_gate = leader.syncGate(),
+    });
     defer hub.stop();
-    leader.setCommitGate(hub.commitGate());
+    leader.setCommitGate(leader.syncGate());
     defer leader.setCommitGate(null);
 
     const GatedCommit = struct {
@@ -1277,7 +1308,7 @@ test "sync_standbys=1: commit blocks until a follower acks through the gate" {
     var polls: usize = 0;
     while (!gated.done.load(.acquire)) : (polls += 1) {
         if (polls >= MAX_POLLS) {
-            hub.commitGate().close();
+            leader.syncGate().close();
             committer.join();
             return error.QuorumTimeout;
         }
@@ -1286,7 +1317,7 @@ test "sync_standbys=1: commit blocks until a follower acks through the gate" {
     committer.join();
 
     try std.testing.expect(!gated.failed.load(.acquire));
-    try std.testing.expect(hub.commitGate().current() >= 1);
+    try std.testing.expect(leader.syncGate().current() >= 1);
 }
 
 test "a follower ahead of the leader parks in the diverged phase" {
@@ -1488,4 +1519,115 @@ test "CommitGate advances monotonically, releases waiters, and fails closed" {
     try std.testing.expectEqual(@as(?error{ReplicationStopped}, error.ReplicationStopped), stopped.result);
 
     try std.testing.expectError(error.ReplicationStopped, gate.awaitQuorum(11));
+}
+
+test "promote refuses while the receiver is streaming" {
+    const allocator = std.testing.allocator;
+    var tmp_leader = std.testing.tmpDir(.{});
+    defer tmp_leader.cleanup();
+    var tmp_follower = std.testing.tmpDir(.{});
+    defer tmp_follower.cleanup();
+
+    const leader = try openStore(allocator, &tmp_leader);
+    defer closeStore(leader);
+    const hub = try Hub.start(allocator, try leader.primaryHost(), .{});
+    defer hub.stop();
+
+    const follower = try openStore(allocator, &tmp_follower);
+    defer closeStore(follower);
+    const recv = try Receiver.start(allocator, try follower.replicaHost(follower, applyReplicaEntry), localReceiverConfig(hub));
+
+    waitForPhase(recv, .streaming) catch |err| {
+        recv.stop();
+        return err;
+    };
+
+    try std.testing.expectError(error.ReplicaStillStreaming, follower.promote());
+
+    recv.stop();
+    try follower.promote();
+    try commitTestRecord(follower, 1, 1);
+}
+
+test "commits against a stopped hub fail with ReplicationStopped on the store-owned gate" {
+    const allocator = std.testing.allocator;
+    var tmp_leader = std.testing.tmpDir(.{});
+    defer tmp_leader.cleanup();
+
+    const leader = try openStore(allocator, &tmp_leader);
+    defer closeStore(leader);
+
+    const hub = try Hub.start(allocator, try leader.primaryHost(), .{
+        .sync_standbys = 1,
+        .commit_gate = leader.syncGate(),
+    });
+    leader.setCommitGate(leader.syncGate());
+    defer leader.setCommitGate(null);
+
+    const GatedCommit = struct {
+        store: *TestStore,
+        result: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+        fn run(self: *@This()) void {
+            commitTestRecord(self.store, 1, 1) catch |err| {
+                self.result.store(if (err == error.ReplicationStopped) 1 else 2, .release);
+                return;
+            };
+            self.result.store(3, .release);
+        }
+    };
+
+    var gated = GatedCommit{ .store = leader };
+    const committer = try std.Thread.spawn(.{}, GatedCommit.run, .{&gated});
+
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u8, 0), gated.result.load(.acquire));
+
+    hub.stop();
+    committer.join();
+    try std.testing.expectEqual(@as(u8, 1), gated.result.load(.acquire));
+
+    try std.testing.expectError(error.ReplicationStopped, commitTestRecord(leader, 2, 2));
+}
+
+test "a reaped follower does not block the next registration" {
+    const allocator = std.testing.allocator;
+    var tmp_leader = std.testing.tmpDir(.{});
+    defer tmp_leader.cleanup();
+
+    const leader = try openStore(allocator, &tmp_leader);
+    defer closeStore(leader);
+    const hub = try Hub.start(allocator, try leader.primaryHost(), .{});
+    defer hub.stop();
+
+    const address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, hub.port());
+    const req = HandshakeRequest{
+        .magic = HANDSHAKE_MAGIC,
+        .version = PROTOCOL_VERSION,
+        .start_lsn = 0,
+        .replica_name = try buildReplicaName("first"),
+    };
+
+    {
+        const conn = try std.net.tcpConnectToAddress(address);
+        try writeFull(conn.handle, std.mem.asBytes(&req));
+        var resp_buf: [@sizeOf(HandshakeResponse)]u8 = undefined;
+        try readFull(conn.handle, &resp_buf);
+        conn.close();
+    }
+
+    var follower_stats: [4]FollowerStatus = undefined;
+    var polls: usize = 0;
+    while (hub.status(&follower_stats).follower_count != 0) : (polls += 1) {
+        if (polls >= MAX_POLLS) return error.ReapTimeout;
+        std.Thread.sleep(POLL_INTERVAL_NS);
+    }
+
+    const conn2 = try std.net.tcpConnectToAddress(address);
+    defer conn2.close();
+    try writeFull(conn2.handle, std.mem.asBytes(&req));
+    var resp_buf: [@sizeOf(HandshakeResponse)]u8 = undefined;
+    try readFull(conn2.handle, &resp_buf);
+    const resp = std.mem.bytesToValue(HandshakeResponse, &resp_buf);
+    try std.testing.expectEqual(@intFromEnum(HandshakeStatus.accepted), resp.status);
 }

@@ -64,7 +64,10 @@ pub const WalWriter = struct {
         defer allocator.free(path);
 
         const scan_file = try openOrCreateFile(path);
-        const scan = scanWal(scan_file, allocator) catch ScanResult{ .last_sequence = 0, .valid_end = 0 };
+        const scan = scanWal(scan_file, allocator) catch |err| {
+            scan_file.close();
+            return err;
+        };
 
         const direct_result = openWithDirect(path);
         const file, const direct_io = direct_result;
@@ -895,4 +898,38 @@ test "stress: concurrent append + sync + truncate, then recovery contract" {
     try std.testing.expect(stats.total_appends.load(.acquire) > 100);
     try std.testing.expect(stats.total_truncates.load(.acquire) >= 3);
     try std.testing.expect(stats.total_syncs.load(.acquire) >= 3);
+}
+
+test "init propagates a scan failure instead of truncating the WAL" {
+    const tmp_dir = "/tmp/wal_test_scan_failure";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    std.fs.makeDirAbsolute(tmp_dir) catch {};
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
+        _ = try writer.append(test_op, "keep-1");
+        _ = try writer.append(test_op, "keep-2");
+        _ = try writer.append(test_op, "keep-3");
+        deinitHeap(writer);
+    }
+
+    var saw_failure = false;
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var writer = WalWriter.init(failing.allocator(), tmp_dir, 32, 0) catch {
+            saw_failure = true;
+            continue;
+        };
+        writer.deinit();
+        break;
+    }
+    try std.testing.expect(saw_failure);
+
+    {
+        const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
+        defer deinitHeap(writer);
+        try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
+    }
 }

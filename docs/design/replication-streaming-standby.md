@@ -52,12 +52,15 @@ restart the receiver.
 ### Synchronous replication as a commit gate
 
 `commit` already waits for local durability (`awaitDurable`). With `sync_standbys = n` and
-`Hub.commitGate()` wired into the store via `setCommitGate`, it then also blocks until the
-n-th highest follower durable ack covers the entry — the analog of Postgres
-`synchronous_commit = on`. Acks carry both durable and applied LSNs, so `Hub.status` can
-report apply lag separately. `Hub.stop` closes the gate and releases blocked commits with
-`error.ReplicationStopped`: with RPO=0 semantics, an unacknowledged commit must fail rather
-than silently degrade to asynchronous.
+the store-owned gate wired into both sides (`Store.syncGate()` passed to
+`HubConfig.commit_gate` and to `setCommitGate`), it then also blocks until the n-th highest
+follower durable ack covers the entry — the analog of Postgres `synchronous_commit = on`.
+The gate's memory belongs to the store, not the hub, so a commit can never dereference a
+freed gate no matter how hub shutdown and commit threads interleave. Acks carry both
+durable and applied LSNs, so `Hub.status` can report apply lag separately. `Hub.stop`
+closes the gate and releases blocked (and any later) commits with
+`error.ReplicationStopped` until a new hub re-arms it: with RPO=0 semantics, an
+unacknowledged commit must fail rather than silently degrade to asynchronous.
 
 ### The follower applies through the same seam as recovery
 
@@ -120,7 +123,10 @@ order of operations, and the order is what makes it safe:
 2. **Pick the most caught-up standby** (highest `Receiver.status().last_durable_lsn`; with
    `sync_standbys > 0` any acked standby is at or past every acknowledged commit).
 3. On the chosen standby: `receiver.stop()`, then `store.promote()`, then `Hub.start` on
-   it so the remaining standbys re-point and resume streaming from their own LSNs.
+   it so the remaining standbys re-point and resume streaming from their own LSNs. The
+   engine enforces this ordering: `promote` fails with `error.ReplicaStillStreaming` while
+   a receiver is live, so a local commit can never interleave with streamed appends in the
+   same WAL.
 4. **Re-point traffic** (the writer Service selector / the TS router's leader transport).
 5. **Re-join the old leader as a standby, never as a writer.** If it accepted any write the
    new leader never saw, its handshake fails `diverged` — wipe its `data_dir`, re-seed with

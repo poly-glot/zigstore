@@ -41,7 +41,7 @@ From that one declaration the engine generates, at comptime:
 
 ## Status
 
-A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (169 tests
+A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (173 tests
 plus a `-Dcpu=baseline` build). Every layer is implemented:
 
 | Surface | State |

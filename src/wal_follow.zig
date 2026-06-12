@@ -82,12 +82,14 @@ pub const FollowReader = struct {
 
         const file = (try self.ensureFile()) orelse return null;
 
-        while (self.offset + wal.HEADER_SIZE <= boundary.offset) {
-            var header_buf: [wal.HEADER_SIZE]u8 = undefined;
-            const hn = try file.preadAll(&header_buf, self.offset);
-            if (hn < wal.HEADER_SIZE) return self.stall(file, boundary);
+        var probe: [4096]u8 = undefined;
 
-            const header = std.mem.bytesToValue(wal.WalEntryHeader, &header_buf);
+        while (self.offset + wal.HEADER_SIZE <= boundary.offset) {
+            const probe_cap: usize = @intCast(@min(@as(u64, probe.len), boundary.offset - self.offset));
+            const pn = try file.preadAll(probe[0..probe_cap], self.offset);
+            if (pn < wal.HEADER_SIZE) return self.stall(file, boundary);
+
+            const header = std.mem.bytesToValue(wal.WalEntryHeader, probe[0..wal.HEADER_SIZE]);
             if (header.sequence == 0) return self.stall(file, boundary);
 
             if (header.data_len > MAX_FOLLOW_DATA_LEN) {
@@ -99,8 +101,13 @@ pub const FollowReader = struct {
             if (entry_end > boundary.offset) return self.stall(file, boundary);
 
             try self.data_buf.resize(self.allocator, header.data_len);
-            const dn = try file.preadAll(self.data_buf.items, self.offset + wal.HEADER_SIZE);
-            if (dn < header.data_len) return self.stall(file, boundary);
+            const inline_end = wal.HEADER_SIZE + @as(usize, header.data_len);
+            if (inline_end <= pn) {
+                @memcpy(self.data_buf.items, probe[wal.HEADER_SIZE..inline_end]);
+            } else {
+                const dn = try file.preadAll(self.data_buf.items, self.offset + wal.HEADER_SIZE);
+                if (dn < header.data_len) return self.stall(file, boundary);
+            }
 
             const computed = std.hash.crc.Crc32.hash(self.data_buf.items);
             if (computed != header.checksum) return self.stall(file, boundary);

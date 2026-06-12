@@ -310,7 +310,9 @@ pub fn Engine(comptime s: Schema) type {
         snapshot_in_progress: std.atomic.Value(bool),
 
         read_only: std.atomic.Value(bool),
+        replica_streaming: std.atomic.Value(bool),
         commit_gate: std.atomic.Value(?*replication.CommitGate),
+        sync_gate: replication.CommitGate,
 
         /// Open (or create) the store under `config.data_dir`, returning a heap-allocated
         /// `*Store` at a stable address. On a fresh directory the header is formatted with the
@@ -394,7 +396,9 @@ pub fn Engine(comptime s: Schema) type {
                 .last_applied_seq = if (wal_writer) |w| w.sequence else 0,
                 .snapshot_in_progress = std.atomic.Value(bool).init(false),
                 .read_only = std.atomic.Value(bool).init(false),
+                .replica_streaming = std.atomic.Value(bool).init(false),
                 .commit_gate = std.atomic.Value(?*replication.CommitGate).init(null),
+                .sync_gate = .{},
             };
 
             inline for (s.indexes) |idx| {
@@ -642,9 +646,13 @@ pub fn Engine(comptime s: Schema) type {
             };
         }
 
-        /// Clears the read-only flag so the store accepts commits. Only call after the old
-        /// leader is fenced — the engine ships no election or fencing of its own.
-        pub fn promote(self: *Store) void {
+        /// Clears the read-only flag so the store accepts commits. Fails with
+        /// `error.ReplicaStillStreaming` while a `Receiver` is attached and live — stop the
+        /// receiver first, so a local commit can never interleave with streamed appends in
+        /// the same WAL. Only call after the old leader is fenced — the engine ships no
+        /// election or fencing of its own.
+        pub fn promote(self: *Store) !void {
+            if (self.replica_streaming.load(.acquire)) return error.ReplicaStillStreaming;
             self.read_only.store(false, .release);
         }
 
@@ -655,9 +663,19 @@ pub fn Engine(comptime s: Schema) type {
         }
 
         /// Installs (or clears with null) the quorum gate `commit` blocks on after
-        /// durability. Wire `Hub.commitGate()` here for synchronous replication.
+        /// durability. For synchronous replication pass `syncGate()` here and in
+        /// `HubConfig.commit_gate`.
         pub fn setCommitGate(self: *Store, gate: ?*replication.CommitGate) void {
             self.commit_gate.store(gate, .release);
+        }
+
+        /// The store-owned quorum gate. Its lifetime is the store's, so a commit can never
+        /// outlive it the way it could a hub-owned gate: wire it into both
+        /// `HubConfig.commit_gate` (the hub advances and closes it) and `setCommitGate`
+        /// (commits wait on it). After `Hub.stop`, waiting commits fail with
+        /// `error.ReplicationStopped`; a new hub re-arms the gate.
+        pub fn syncGate(self: *Store) *replication.CommitGate {
+            return &self.sync_gate;
         }
 
         /// The `replication.PrimaryHost` view of this store for `Hub.start`: its WAL
@@ -689,6 +707,7 @@ pub fn Engine(comptime s: Schema) type {
                 .apply_cond = &self.apply_cond,
                 .last_applied_seq = &self.last_applied_seq,
                 .read_only = &self.read_only,
+                .streaming = &self.replica_streaming,
                 .ctx = ctx,
                 .apply_entry = apply_entry,
             };

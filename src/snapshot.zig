@@ -35,21 +35,7 @@ pub const SnapshotHost = struct {
 /// Take a snapshot now, returning its WAL sequence and duration. Fails with
 /// `error.SnapshotInProgress` if another snapshot holds the in-progress guard.
 pub fn forceSnapshot(host: SnapshotHost) !SnapshotResult {
-    if (host.snapshot_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
-        return error.SnapshotInProgress;
-    }
-    defer host.snapshot_in_progress.store(false, .release);
-
-    const start_ns = std.time.nanoTimestamp();
-
-    const wal_seq: u64 = host.walSequence(host.ctx);
-
-    var mgr = SnapshotManager.init(host.data_dir, 0);
-    try mgr.createSnapshot(host, wal_seq);
-
-    const end_ns = std.time.nanoTimestamp();
-    const duration_ms: u64 = @intCast(@divTrunc(end_ns - start_ns, std.time.ns_per_ms));
-    return .{ .wal_sequence = wal_seq, .duration_ms = duration_ms };
+    return takeSnapshot(host, false);
 }
 
 /// The on-disk name of the consistent `store.dat` copy `forceBaseBackup` produces.
@@ -60,6 +46,10 @@ pub const BASE_BACKUP_FILE = "store.dat.base";
 /// sequence (pages mutate in place — an unlocked copy could tear). Serves a replica base
 /// backup; the caller owns deleting the copy once consumed.
 pub fn forceBaseBackup(host: SnapshotHost) !SnapshotResult {
+    return takeSnapshot(host, true);
+}
+
+fn takeSnapshot(host: SnapshotHost, copy_base: bool) !SnapshotResult {
     if (host.snapshot_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
         return error.SnapshotInProgress;
     }
@@ -70,23 +60,23 @@ pub fn forceBaseBackup(host: SnapshotHost) !SnapshotResult {
     const wal_seq: u64 = host.walSequence(host.ctx);
 
     var mgr = SnapshotManager.init(host.data_dir, 0);
-
-    {
-        host.apply_mutex.lock();
-        defer host.apply_mutex.unlock();
-        host.mt_drain_mutex.lock();
-        defer host.mt_drain_mutex.unlock();
-
-        try host.flushCache(host.ctx);
-        try host.flushHeader(host.ctx);
-        try copyStoreToBase(host.data_dir);
-    }
-
+    try flushUnderLocks(host, copy_base);
     try mgr.writeMeta(host, wal_seq);
 
     const end_ns = std.time.nanoTimestamp();
     const duration_ms: u64 = @intCast(@divTrunc(end_ns - start_ns, std.time.ns_per_ms));
     return .{ .wal_sequence = wal_seq, .duration_ms = duration_ms };
+}
+
+fn flushUnderLocks(host: SnapshotHost, copy_base: bool) !void {
+    host.apply_mutex.lock();
+    defer host.apply_mutex.unlock();
+    host.mt_drain_mutex.lock();
+    defer host.mt_drain_mutex.unlock();
+
+    try host.flushCache(host.ctx);
+    try host.flushHeader(host.ctx);
+    if (copy_base) try copyStoreToBase(host.data_dir);
 }
 
 fn copyStoreToBase(data_dir: []const u8) !void {
@@ -149,16 +139,7 @@ pub const SnapshotManager = struct {
         host: SnapshotHost,
         wal_sequence: u64,
     ) !void {
-        {
-            host.apply_mutex.lock();
-            defer host.apply_mutex.unlock();
-            host.mt_drain_mutex.lock();
-            defer host.mt_drain_mutex.unlock();
-
-            try host.flushCache(host.ctx);
-            try host.flushHeader(host.ctx);
-        }
-
+        try flushUnderLocks(host, false);
         try self.writeMeta(host, wal_sequence);
     }
 
