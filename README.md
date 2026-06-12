@@ -84,7 +84,7 @@ exe_mod.addImport("zigstore", zigstore);
 Consume by tag once published. Never hand-edit the hash:
 
 ```bash
-zig fetch --save "https://github.com/poly-glot/zigstore/archive/refs/tags/v1.0.0.tar.gz"
+zig fetch --save "https://github.com/poly-glot/zigstore/archive/refs/tags/v1.1.0.tar.gz"
 ```
 
 ## API at a glance
