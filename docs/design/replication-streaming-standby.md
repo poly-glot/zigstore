@@ -32,6 +32,12 @@ useless as a replication LSN. It now preserves the sequence (the file is truncat
 numbering continues), and `WalWriter.init` takes a `base_sequence` resumed from
 `snapshot.meta`, so the LSN survives restarts even when the WAL file is empty.
 
+Truncation also bumps an in-memory **truncation epoch** carried in `DurableBoundary`, so a
+leader-side `FollowReader` detects "the file restarted under me" deterministically and
+rescans from offset 0. (The earlier `boundary.offset < reader.offset` comparison was a
+heuristic that an O_DIRECT writer could out-pace.) The epoch is process-local by design: a
+leader restart recreates the hub and its readers with it.
+
 ### Connected-followers-only retain floor; lsn_too_old re-bootstrap
 
 The hub holds `WalWriter.setRetainFloor` at the minimum durable ack of the *connected*
@@ -86,6 +92,41 @@ supervisor thread — `needs_rebootstrap`, `diverged`, `failed` (a local WAL or 
 must never be acked past) — because each needs an operator or the consumer's control loop,
 not a retry.
 
+## Health and readiness (the Tier 0 op convention)
+
+Ops are app-defined, so the engine ships the facts, not the op: `Store.healthStatus()`
+returns `{ read_only, last_applied_lsn, durable_lsn }`, cheap enough for a probe path. The
+convention for a consumer:
+
+- expose a **ping/health op** (dmozdb convention: a high op number, e.g. 255) that returns
+  `healthStatus()` — TCP connect alone is a liveness check; this is the readiness one;
+- a **leader** is ready when it answers the op and `read_only` is false;
+- a **replica** is ready when `read_only` is true and its apply lag is within budget:
+  `Receiver.status().leader_durable_lsn - healthStatus().last_applied_lsn <= N` — the same
+  numbers the generated TS router's read-your-writes fence consumes;
+- `Hub.status` gives the leader-side view of every follower's durable/applied acks for
+  dashboards and alerting.
+
+## Promotion runbook (consumer-side; the engine ships only the mechanism)
+
+The engine has no election, no fencing, and no timeline ids — `promote()` flips a flag.
+The consumer's control loop (a Kubernetes Lease holder, an operator, a script) owns the
+order of operations, and the order is what makes it safe:
+
+1. **Fence the old leader first.** Make it unable to accept writes before anything else:
+   delete/cordon its pod, cut it off with a NetworkPolicy, or — if it is still reachable —
+   call `demote()` on it and stop its `Hub`. A paused-not-dead leader that wakes up later
+   and keeps writing is the split-brain case nothing downstream can repair.
+2. **Pick the most caught-up standby** (highest `Receiver.status().last_durable_lsn`; with
+   `sync_standbys > 0` any acked standby is at or past every acknowledged commit).
+3. On the chosen standby: `receiver.stop()`, then `store.promote()`, then `Hub.start` on
+   it so the remaining standbys re-point and resume streaming from their own LSNs.
+4. **Re-point traffic** (the writer Service selector / the TS router's leader transport).
+5. **Re-join the old leader as a standby, never as a writer.** If it accepted any write the
+   new leader never saw, its handshake fails `diverged` — wipe its `data_dir`, re-seed with
+   `fetchBaseBackup`, and start a `Receiver`. The diverged verdict is the engine's last
+   line of defense, not the fencing mechanism.
+
 ## Wire format (version 1)
 
 Handshake (little-endian, exact sizes locked by comptime asserts):
@@ -104,8 +145,10 @@ Stream:
   per drained burst, and on every heartbeat).
 
 Base backup (after an `accepted` response whose `durable_lsn` is the backup's WAL
-sequence): `u64 len` + `snapshot.meta` bytes, then `u64 len` + `store.dat` bytes; the
-leader closes when done. New trailing files would be additive.
+sequence): `u64 len` + `snapshot.meta` bytes + `u32 crc32`, then `u64 len` + `store.dat`
+bytes + `u32 crc32`; the leader closes when done. The CRC32 trailers are end-to-end checks
+over each file's bytes — a mismatch fails the fetch with `BackupChecksumMismatch` rather
+than seeding a silently corrupt replica. New trailing files would be additive.
 
 Extensions follow the protocol rule: optional trailing bytes, never a forked message tag.
 

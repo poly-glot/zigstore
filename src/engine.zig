@@ -35,6 +35,16 @@ const MEMTABLE_SHARDS = memtable.NUM_SHARDS;
 /// One replayed WAL entry handed to a `recover` hook: its sequence, op code, and payload bytes.
 pub const ReplayEntry = wal_replay.ReplayEntry;
 
+/// What `Store.healthStatus` reports — the engine-owned facts a consumer's health/ping op
+/// serves for liveness and readiness probes. A replica's readiness is typically
+/// `!read_only or (leader durable LSN - last_applied_lsn) <= lag budget`, with the leader
+/// LSN taken from `replication.Receiver.status()`.
+pub const HealthStatus = struct {
+    read_only: bool,
+    last_applied_lsn: u64,
+    durable_lsn: u64,
+};
+
 const log = std.log.scoped(.engine);
 
 /// How an index orders its keys. The kind is metadata for validation and client codegen;
@@ -617,6 +627,21 @@ pub fn Engine(comptime s: Schema) type {
             return self.read_only.load(.acquire);
         }
 
+        /// The engine-owned health facts for a consumer's health/ping op: the read-only
+        /// flag, the last applied WAL sequence, and the last durable WAL sequence (0 when
+        /// the store runs without a WAL). Cheap enough for a readiness probe path.
+        pub fn healthStatus(self: *Store) HealthStatus {
+            self.apply_mutex.lock();
+            const applied = self.last_applied_seq;
+            self.apply_mutex.unlock();
+
+            return .{
+                .read_only = self.read_only.load(.acquire),
+                .last_applied_lsn = applied,
+                .durable_lsn = if (self.wal_writer) |*w| w.durableBoundary().sequence else 0,
+            };
+        }
+
         /// Clears the read-only flag so the store accepts commits. Only call after the old
         /// leader is fenced — the engine ships no election or fencing of its own.
         pub fn promote(self: *Store) void {
@@ -980,4 +1005,28 @@ test "reopen resumes the WAL sequence from snapshot metadata after truncation" {
         defer closeTestStore(store);
         try std.testing.expectEqual(@as(u64, 3), store.wal_writer.?.getSequence());
     }
+}
+
+test "healthStatus reports the read-only flag and applied/durable LSNs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    const fresh = store.healthStatus();
+    try std.testing.expect(!fresh.read_only);
+    try std.testing.expectEqual(@as(u64, 0), fresh.last_applied_lsn);
+    try std.testing.expectEqual(@as(u64, 0), fresh.durable_lsn);
+
+    const w = &store.wal_writer.?;
+    _ = try w.append(1, "a");
+    _ = try w.append(1, "b");
+    try w.sync();
+
+    store.demote();
+    const demoted = store.healthStatus();
+    try std.testing.expect(demoted.read_only);
+    try std.testing.expectEqual(@as(u64, 2), demoted.durable_lsn);
 }

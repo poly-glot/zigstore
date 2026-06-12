@@ -23,8 +23,9 @@ pub const HANDSHAKE_MAGIC: u32 = 0x5A524550;
 
 /// Alternate handshake magic requesting a base backup instead of a stream: the leader
 /// replies with `accepted` (`durable_lsn` = the backup's WAL sequence) followed by
-/// `u64 len + snapshot.meta bytes`, then `u64 len + store.dat bytes`, and closes. A leader
-/// without a snapshot host (or one predating backups) replies `rejected`.
+/// `u64 len + snapshot.meta bytes + u32 crc32`, then `u64 len + store.dat bytes +
+/// u32 crc32`, and closes. The CRC32 trailers are end-to-end checks over each file's
+/// bytes. A leader without a snapshot host (or one predating backups) replies `rejected`.
 pub const BACKUP_MAGIC: u32 = 0x5A42414B;
 
 /// Replication wire-protocol version; bumped on any breaking change to the stream framing.
@@ -932,6 +933,9 @@ pub fn fetchBaseBackup(allocator: std.mem.Allocator, cfg: ReceiverConfig, data_d
     if (meta_len < @sizeOf(snapshot.SnapshotHeader) or meta_len > 4096) return error.BadFrame;
     var meta_buf: [4096]u8 = undefined;
     try readFull(stream.handle, meta_buf[0..meta_len]);
+    if (try readCrc(stream.handle) != std.hash.crc.Crc32.hash(meta_buf[0..meta_len])) {
+        return error.BackupChecksumMismatch;
+    }
 
     const meta = std.mem.bytesToValue(snapshot.SnapshotHeader, meta_buf[0..@sizeOf(snapshot.SnapshotHeader)]);
     if (meta.magic != snapshot.SNAP_MAGIC) return error.BadFrame;
@@ -968,6 +972,18 @@ fn readLen(fd: posix.socket_t) !u64 {
     return std.mem.readInt(u64, &len_buf, .little);
 }
 
+fn readCrc(fd: posix.socket_t) !u32 {
+    var crc_buf: [4]u8 = undefined;
+    try readFull(fd, &crc_buf);
+    return std.mem.readInt(u32, &crc_buf, .little);
+}
+
+fn writeCrc(fd: posix.socket_t, value: u32) !void {
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, value, .little);
+    try writeFull(fd, &crc_buf);
+}
+
 fn sendFile(fd: posix.socket_t, path: []const u8) !void {
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
     defer file.close();
@@ -977,29 +993,37 @@ fn sendFile(fd: posix.socket_t, path: []const u8) !void {
     std.mem.writeInt(u64, &len_buf, size, .little);
     try writeFull(fd, &len_buf);
 
+    var crc = std.hash.crc.Crc32.init();
     var chunk: [64 * 1024]u8 = undefined;
     var remaining: u64 = size;
     while (remaining > 0) {
         const want: usize = @intCast(@min(remaining, chunk.len));
         const n = try file.readAll(chunk[0..want]);
         if (n == 0) return error.ConnectionClosed;
+        crc.update(chunk[0..n]);
         try writeFull(fd, chunk[0..n]);
         remaining -= n;
     }
+
+    try writeCrc(fd, crc.final());
 }
 
 fn receiveFile(fd: posix.socket_t, path: []const u8, len: u64) !void {
     const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
 
+    var crc = std.hash.crc.Crc32.init();
     var chunk: [64 * 1024]u8 = undefined;
     var remaining: u64 = len;
     while (remaining > 0) {
         const want: usize = @intCast(@min(remaining, chunk.len));
         try readFull(fd, chunk[0..want]);
+        crc.update(chunk[0..want]);
         try file.writeAll(chunk[0..want]);
         remaining -= want;
     }
+
+    if (try readCrc(fd) != crc.final()) return error.BackupChecksumMismatch;
 
     try file.sync();
 }

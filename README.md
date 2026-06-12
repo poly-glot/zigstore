@@ -41,7 +41,7 @@ From that one declaration the engine generates, at comptime:
 
 ## Status
 
-A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (168 tests
+A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (169 tests
 plus a `-Dcpu=baseline` build). Every layer is implemented:
 
 | Surface | State |
@@ -109,7 +109,7 @@ store.counter("next_link_id").* = 0;              // *u64 into the header (singl
 try store.drainMemtables();                       // flush the write memtables into the trees
 ```
 
-The dynamic seams stay runtime callbacks the consumer supplies: `store.recover(ctx, .{ .apply_entry, .on_replayed, .bootstrap })`, `store.spawnWorker(ctx, .{ .interval_ns, .tick })`, `zigstore.commit(Record, store, op_code, record, ctx, serialize_fn, apply_fn)`, snapshot over a `SnapshotHost`, replication over `store.primaryHost()` / `store.replicaHost(ctx, apply_entry)` (`zigstore.replication.Hub.start` on the leader, `Receiver.start` on a standby — see [`docs/design/replication-streaming-standby.md`](docs/design/replication-streaming-standby.md)), `zigstore.protocol.processFrames(ctx, conn, dispatch_fn, op_latency, response_reserve)`, and `zigstore.run(Store, ctx, handler, config)`.
+The dynamic seams stay runtime callbacks the consumer supplies: `store.recover(ctx, .{ .apply_entry, .on_replayed, .bootstrap })`, `store.spawnWorker(ctx, .{ .interval_ns, .tick })`, `zigstore.commit(Record, store, op_code, record, ctx, serialize_fn, apply_fn)`, snapshot over a `SnapshotHost`, health/readiness facts via `store.healthStatus()`, replication over `store.primaryHost()` / `store.replicaHost(ctx, apply_entry)` (`zigstore.replication.Hub.start` on the leader, `Receiver.start` on a standby — see [`docs/design/replication-streaming-standby.md`](docs/design/replication-streaming-standby.md)), `zigstore.protocol.processFrames(ctx, conn, dispatch_fn, op_latency, response_reserve)`, and `zigstore.run(Store, ctx, handler, config)`.
 
 See [`examples/basic.zig`](examples/basic.zig) for a full directory-shaped store driven end to end.
 

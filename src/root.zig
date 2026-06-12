@@ -14,6 +14,9 @@
 //!   - `Worker` / `ReplayEntry`: the background-worker handle and one replayed WAL entry handed
 //!     to a `recover` hook (`Store.Config` is the per-store open config, reached as a member of
 //!     the generated `Store`).
+//!   - `HealthStatus`: the engine-owned facts (`read_only`, applied/durable LSNs) a consumer's
+//!     health/ping op serves for k8s liveness and replica-lag readiness, via
+//!     `Store.healthStatus()`.
 //!   - `commit` / `snapshot` / `SnapshotHost`: the durable write path (serialize, WAL-append,
 //!     in-order apply, durability wait) over a caller-supplied record type, and point-in-time
 //!     snapshots driven through the `SnapshotHost` interface a `Store` satisfies via
@@ -64,6 +67,7 @@ pub const BTreeError = @import("btree/btree.zig").BTreeError;
 pub const MemTable = engine.MemTable;
 pub const ReplayEntry = engine.ReplayEntry;
 pub const Worker = engine.Worker;
+pub const HealthStatus = engine.HealthStatus;
 
 pub const snapshot = @import("snapshot.zig");
 pub const SnapshotHost = snapshot.SnapshotHost;

@@ -33,6 +33,7 @@ pub const FollowReader = struct {
     path: []const u8,
     file: ?std.fs.File,
     offset: u64,
+    truncation_epoch: u64,
     after_lsn: u64,
     last_sequence: u64,
     data_buf: std.ArrayList(u8),
@@ -48,6 +49,7 @@ pub const FollowReader = struct {
             .path = path,
             .file = null,
             .offset = 0,
+            .truncation_epoch = 0,
             .after_lsn = after_lsn,
             .last_sequence = after_lsn,
             .data_buf = .{},
@@ -64,14 +66,19 @@ pub const FollowReader = struct {
     }
 
     /// Returns the next entry at or below `boundary`, or null when caught up
-    /// (re-poll with a fresh boundary). A boundary offset behind the reader's
-    /// position means the writer truncated after a checkpoint; the reader
+    /// (re-poll with a fresh boundary). A boundary truncation epoch ahead of
+    /// the reader's means the writer truncated after a checkpoint; the reader
     /// rescans from the start, where sequences continue monotonically.
     /// Errors: `WalSequenceGap` when the file no longer covers the next
     /// expected sequence, `InconsistentWal` when the same offset stays
     /// unreadable across `MAX_STALLS_AT_SAME_OFFSET` polls.
     pub fn next(self: *FollowReader, boundary: wal.DurableBoundary) !?FollowedEntry {
-        if (boundary.offset < self.offset) self.offset = 0;
+        if (boundary.truncation_epoch != self.truncation_epoch) {
+            self.truncation_epoch = boundary.truncation_epoch;
+            self.offset = 0;
+            self.stall_offset = 0;
+            self.stall_count = 0;
+        }
 
         const file = (try self.ensureFile()) orelse return null;
 
@@ -258,7 +265,7 @@ test "follow reader respects a stale durable boundary" {
     try std.testing.expectEqual(@as(u64, 3), (try reader.next(fresh)).?.sequence);
 }
 
-test "follow reader continues across a checkpoint truncation" {
+test "follow reader continues across a checkpoint truncation via the epoch rewind" {
     const tmp_dir = "/tmp/wal_follow_test_truncate";
     std.fs.deleteTreeAbsolute(tmp_dir) catch {};
     try std.fs.makeDirAbsolute(tmp_dir);
@@ -270,9 +277,8 @@ test "follow reader continues across a checkpoint truncation" {
     var reader = try FollowReader.init(std.testing.allocator, tmp_dir, 0);
     defer reader.deinit();
 
-    const big_payload = [_]u8{0xAB} ** 8192;
-    _ = try writer.append(test_op, &big_payload);
-    _ = try writer.append(test_op, &big_payload);
+    _ = try writer.append(test_op, "pre-1");
+    _ = try writer.append(test_op, "pre-2");
     try writer.sync();
 
     try std.testing.expectEqual(@as(u64, 1), (try reader.next(writer.durableBoundary())).?.sequence);

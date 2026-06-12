@@ -29,6 +29,7 @@ pub const HEADER_SIZE: usize = @sizeOf(WalEntryHeader);
 pub const DurableBoundary = struct {
     sequence: u64,
     offset: u64,
+    truncation_epoch: u64,
 };
 
 pub const WalWriter = struct {
@@ -55,6 +56,7 @@ pub const WalWriter = struct {
     direct_buf: []u8,
     write_offset: u64,
     durable_offset: u64,
+    truncation_epoch: u64,
     retain_floor: std.atomic.Value(u64),
 
     pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64) !WalWriter {
@@ -113,6 +115,7 @@ pub const WalWriter = struct {
             .direct_buf = direct_buf,
             .write_offset = initial_offset,
             .durable_offset = initial_offset,
+            .truncation_epoch = 0,
             .retain_floor = std.atomic.Value(u64).init(std.math.maxInt(u64)),
         };
     }
@@ -166,6 +169,7 @@ pub const WalWriter = struct {
         self.pending_max_seq = 0;
         self.write_offset = 0;
         self.durable_offset = 0;
+        self.truncation_epoch += 1;
         self.flush_done_cond.broadcast();
     }
 
@@ -229,7 +233,11 @@ pub const WalWriter = struct {
     pub fn durableBoundary(self: *WalWriter) DurableBoundary {
         self.lock.lock();
         defer self.lock.unlock();
-        return .{ .sequence = self.last_durable_seq, .offset = self.durable_offset };
+        return .{
+            .sequence = self.last_durable_seq,
+            .offset = self.durable_offset,
+            .truncation_epoch = self.truncation_epoch,
+        };
     }
 
     pub fn waitDurableBeyond(self: *WalWriter, sequence: u64, timeout_ns: u64) bool {
