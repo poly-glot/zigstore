@@ -8,18 +8,34 @@
 
 const std = @import("std");
 
-/// Append `record` to the WAL under op code `op_code`, apply it in WAL-sequence order, and
-/// return once it is durable.
+/// Per-commit durability policy for `commitSeq`.
+pub const CommitOptions = struct {
+    /// When a `CommitGate` is installed on the store and this is true, the commit returns only
+    /// after the gate's quorum has acked the entry durable (synchronous replication). Set false
+    /// to return as soon as the entry is locally durable, skipping the quorum wait even while a
+    /// gate is installed — for writes whose loss on an un-acked-leader crash carries no cost and
+    /// must not pay the cross-node ack latency.
+    await_quorum: bool = true,
+};
+
+/// Append `record` to the WAL under op code `op_code`, apply it in WAL-sequence order, wait
+/// until durable, and return the entry's assigned WAL sequence.
 ///
 /// `serialize_fn` encodes the record to a freshly-allocated buffer the engine frees. `apply_fn`
 /// receives the caller's opaque `ctx` — the application context the engine never names — and
 /// applies the record while the apply mutex is held, after every lower-sequence commit has
 /// applied, so the in-memory state mutates in exact WAL order. Fails with `error.WalDisabled` if
 /// the store has no WAL writer, and with `error.ReadOnlyReplica` on a demoted store (only the
-/// replication receiver writes a replica's WAL). When a `CommitGate` is set on the store,
-/// returns only after the configured quorum of followers has acked the entry durable, or fails
-/// with `error.ReplicationStopped` once replication shuts down.
-pub fn commit(
+/// replication receiver writes a replica's WAL). When a `CommitGate` is set on the store and
+/// `options.await_quorum` is true, returns only after the configured quorum of followers has
+/// acked the entry durable, or fails with `error.ReplicationStopped` once replication shuts down;
+/// when `options.await_quorum` is false the quorum wait is skipped (the entry is still locally
+/// durable and still streamed to followers asynchronously).
+///
+/// The returned sequence is the durable — and, under a quorum-awaited commit, replicated — LSN
+/// of this write: hand it back to a reader to fence a read-your-writes path, or await it on a
+/// `CommitGate` out-of-band.
+pub fn commitSeq(
     comptime Record: type,
     store: anytype,
     op_code: u8,
@@ -27,7 +43,8 @@ pub fn commit(
     ctx: *anyopaque,
     serialize_fn: *const fn (std.mem.Allocator, Record) anyerror![]u8,
     apply_fn: *const fn (ctx: *anyopaque, Record) anyerror!void,
-) !void {
+    options: CommitOptions,
+) !u64 {
     if (store.read_only.load(.acquire)) return error.ReadOnlyReplica;
 
     const encoded = try serialize_fn(store.allocator, record);
@@ -56,9 +73,28 @@ pub fn commit(
         try w.awaitDurable(seq);
     }
 
-    if (store.commit_gate.load(.acquire)) |gate| {
-        try gate.awaitQuorum(seq);
+    if (options.await_quorum) {
+        if (store.commit_gate.load(.acquire)) |gate| {
+            try gate.awaitQuorum(seq);
+        }
     }
+
+    return seq;
+}
+
+/// Append, apply in WAL-sequence order, and return once durable (and quorum-acked when a
+/// `CommitGate` is set). The fixed-policy form of `commitSeq` with default `CommitOptions`,
+/// discarding the assigned sequence; existing consumers call this and its behaviour is unchanged.
+pub fn commit(
+    comptime Record: type,
+    store: anytype,
+    op_code: u8,
+    record: Record,
+    ctx: *anyopaque,
+    serialize_fn: *const fn (std.mem.Allocator, Record) anyerror![]u8,
+    apply_fn: *const fn (ctx: *anyopaque, Record) anyerror!void,
+) !void {
+    _ = try commitSeq(Record, store, op_code, record, ctx, serialize_fn, apply_fn, .{});
 }
 
 const engine = @import("engine.zig");
@@ -166,4 +202,42 @@ test "concurrent commits apply in WAL-sequence order and advance last_applied_se
     for (applied_log.seqs[0..applied_log.count], 0..) |seq, i| {
         try std.testing.expectEqual(@as(u64, i + 1), seq);
     }
+}
+
+test "commitSeq returns the assigned monotonic WAL sequence" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    defer store.deinit();
+
+    const s1 = try commitSeq(TestRecord, store, 1, .{ .id = 1, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{});
+    const s2 = try commitSeq(TestRecord, store, 1, .{ .id = 2, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{});
+
+    try std.testing.expectEqual(@as(u64, 1), s1);
+    try std.testing.expectEqual(@as(u64, 2), s2);
+    try std.testing.expectEqual(s2, store.last_applied_seq);
+}
+
+test "commitSeq await_quorum=false skips an installed gate that commit blocks on" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    defer store.deinit();
+
+    const gate = store.syncGate();
+    store.setCommitGate(gate);
+    gate.close();
+
+    try std.testing.expectError(error.ReplicationStopped, commit(TestRecord, store, 1, .{ .id = 1, .value = 1 }, store, serializeTestRecord, applyTestRecord));
+
+    const relaxed_seq = try commitSeq(TestRecord, store, 1, .{ .id = 2, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{ .await_quorum = false });
+    try std.testing.expectEqual(store.last_applied_seq, relaxed_seq);
 }
