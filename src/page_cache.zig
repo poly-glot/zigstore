@@ -58,9 +58,22 @@ pub const PageCache = struct {
             .alloc_lock = .{},
         };
 
+        var built: usize = 0;
+        errdefer {
+            var j: usize = 0;
+            while (j < built) : (j += 1) {
+                self.shards[j].map.deinit();
+                self.shards[j].free_list.deinit(allocator);
+                allocator.free(self.shards[j].entries);
+            }
+        }
+
         for (&self.shards) |*shard| {
             const entries = try allocator.alloc(CacheEntry, per_shard);
+            errdefer allocator.free(entries);
+
             var fl: std.ArrayListUnmanaged(*CacheEntry) = .{};
+            errdefer fl.deinit(allocator);
             try fl.ensureTotalCapacity(allocator, per_shard);
 
             for (0..per_shard) |i| {
@@ -76,6 +89,7 @@ pub const PageCache = struct {
                 .tail = null,
                 .lock = .{},
             };
+            built += 1;
         }
 
         return self;
@@ -582,4 +596,24 @@ test "allocatePage assigns sequential IDs and grows file" {
 
     const size = try file.getEndPos();
     try std.testing.expect(size >= @as(u64, cache.page_count) * page.PAGE_SIZE);
+}
+
+test "init frees every partial allocation when an allocation fails midway" {
+    const path = "/tmp/test_page_cache_init_leak.db";
+    const file = try createTempFileAt(path);
+    defer file.close();
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var saw_failure = false;
+    var fail_index: usize = 0;
+    while (fail_index < 2 * NUM_SHARDS) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var cache = PageCache.init(failing.allocator(), file, NUM_SHARDS * 4) catch {
+            saw_failure = true;
+            continue;
+        };
+        cache.deinit();
+        break;
+    }
+    try std.testing.expect(saw_failure);
 }

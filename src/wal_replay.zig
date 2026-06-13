@@ -161,7 +161,7 @@ test "write and read back WAL entries" {
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0);
+        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
 
         _ = try writer.append(test_op, "category-one");
@@ -206,7 +206,7 @@ test "replay with min_sequence filter" {
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0);
+        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
 
         _ = try writer.append(test_op, "first");
@@ -238,7 +238,7 @@ test "corrupted entry stops replay" {
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0);
+        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
 
         _ = try writer.append(test_op, "valid-entry");
@@ -314,7 +314,7 @@ test "wal_replay: single entry replays once with correct payload" {
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0);
+        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         _ = try writer.append(test_op, "only-entry");
         try writer.sync();
@@ -345,7 +345,7 @@ test "wal_replay: multi-entry replay preserves sequence order" {
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0);
+        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         var buf: [16]u8 = undefined;
         for (0..50) |i| {
@@ -371,7 +371,7 @@ test "wal_replay: torn tail discards partial entry without error" {
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0);
+        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         for (0..10) |i| {
             var buf: [16]u8 = undefined;
@@ -402,7 +402,7 @@ test "wal_replay: idempotent on second pass" {
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0);
+        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         _ = try writer.append(test_op, "first");
         _ = try writer.append(test_op, "second");

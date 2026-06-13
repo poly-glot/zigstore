@@ -47,4 +47,27 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run engine + example tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_example_tests.step);
+
+    const zigstore_fast = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/write_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("zigstore", zigstore_fast);
+
+    const bench = b.addExecutable(.{
+        .name = "write_bench",
+        .root_module = bench_mod,
+    });
+
+    const run_bench = b.addRunArtifact(bench);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run the multi-sharded write benchmark (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 }

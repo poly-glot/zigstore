@@ -58,8 +58,9 @@ pub const WalWriter = struct {
     durable_offset: u64,
     truncation_epoch: u64,
     retain_floor: std.atomic.Value(u64),
+    fsync_count: std.atomic.Value(u64),
 
-    pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64) !WalWriter {
+    pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool) !WalWriter {
         const path = try std.fs.path.join(allocator, &.{ dir, "wal.bin" });
         defer allocator.free(path);
 
@@ -69,8 +70,14 @@ pub const WalWriter = struct {
             return err;
         };
 
-        const direct_result = openWithDirect(path);
-        const file, const direct_io = direct_result;
+        const file, const direct_io = blk: {
+            if (want_direct_io) break :blk openWithDirect(path);
+            const buffered = openOrCreateFile(path) catch |err| {
+                scan_file.close();
+                return err;
+            };
+            break :blk .{ buffered, false };
+        };
         errdefer file.close();
 
         const initial_offset = settleTail(scan_file, scan.valid_end, direct_io) catch |err| {
@@ -120,6 +127,7 @@ pub const WalWriter = struct {
             .durable_offset = initial_offset,
             .truncation_epoch = 0,
             .retain_floor = std.atomic.Value(u64).init(std.math.maxInt(u64)),
+            .fsync_count = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -255,6 +263,21 @@ pub const WalWriter = struct {
         self.retain_floor.store(lsn, .release);
     }
 
+    /// Whether the WAL opened with `O_DIRECT` (`true`) or fell back to buffered I/O (`false`)
+    /// because the filesystem rejected direct I/O. Lets an observer interpret the durability
+    /// cost: buffered `fdatasync` on an overlay/virtiofs mount behaves unlike `O_DIRECT` on a
+    /// raw block device.
+    pub fn usingDirectIo(self: *const WalWriter) bool {
+        return self.direct_io;
+    }
+
+    /// The number of `fdatasync` calls the flusher has completed since open. Under group commit
+    /// this trails the append count; `appends / fsyncCount()` is the mean batch occupancy, which
+    /// distinguishes a parallelism win from a change in `fdatasync` amortization.
+    pub fn fsyncCount(self: *const WalWriter) u64 {
+        return self.fsync_count.load(.monotonic);
+    }
+
     fn swapAndFlush(self: *WalWriter) !void {
         while (self.back_in_flight) {
             self.flush_done_cond.wait(&self.lock);
@@ -312,6 +335,7 @@ pub const WalWriter = struct {
         }
 
         try posix.fdatasync(self.file.handle);
+        _ = self.fsync_count.fetchAdd(1, .monotonic);
     }
 
     fn paddedLength(n: usize) usize {
@@ -501,7 +525,7 @@ pub const WalWriter = struct {
 
 fn initHeap(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64) !*WalWriter {
     const w = try allocator.create(WalWriter);
-    w.* = try WalWriter.init(allocator, dir, batch_size, base_sequence);
+    w.* = try WalWriter.init(allocator, dir, batch_size, base_sequence, true);
     try w.startFlusher();
     return w;
 }
@@ -918,7 +942,7 @@ test "init propagates a scan failure instead of truncating the WAL" {
     var fail_index: usize = 0;
     while (fail_index < 16) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var writer = WalWriter.init(failing.allocator(), tmp_dir, 32, 0) catch {
+        var writer = WalWriter.init(failing.allocator(), tmp_dir, 32, 0, true) catch {
             saw_failure = true;
             continue;
         };
