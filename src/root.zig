@@ -21,6 +21,9 @@
 //!     in-order apply, durability wait) over a caller-supplied record type, and point-in-time
 //!     snapshots driven through the `SnapshotHost` interface a `Store` satisfies via
 //!     `Store.snapshotHost()`.
+//!   - `ShardSet`: the multi-sharded writer — N independent `Store`s under one `data_dir`, each a
+//!     separate serialization domain, with keys routed by hash so aggregate write throughput
+//!     scales with the shard count. Composes over a generated `Engine(schema)` store type.
 //!
 //!   - `BloomFilter`: the lock-free probabilistic set fronting a uniqueness check.
 //!   - `inverted_index`: the token-stream toolkit (`TokenIterator`, `MIN_TOKEN_LEN`,
@@ -75,6 +78,7 @@ pub const SnapshotResult = snapshot.SnapshotResult;
 pub const SnapshotManager = snapshot.SnapshotManager;
 pub const forceSnapshot = snapshot.forceSnapshot;
 pub const commit = @import("commit.zig").commit;
+pub const ShardSet = @import("shard.zig").ShardSet;
 pub const replication = @import("replication.zig");
 
 pub const protocol = @import("protocol/framing.zig");
@@ -117,6 +121,7 @@ test {
     _ = @import("replication.zig");
     _ = @import("snapshot.zig");
     _ = @import("commit.zig");
+    _ = @import("shard.zig");
 
     _ = @import("btree/btree.zig");
     _ = @import("btree/btree_insert.zig");

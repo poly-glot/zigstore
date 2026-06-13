@@ -1,6 +1,6 @@
 .{
     .name = .zigstore,
-    .version = "1.1.0",
+    .version = "1.2.0",
     .fingerprint = 0x6a18cb8f8f46ee2e,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{},
@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "examples",
+        "bench",
         "README.md",
         "LICENSE",
     },

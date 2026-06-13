@@ -113,6 +113,37 @@ The dynamic seams stay runtime callbacks the consumer supplies: `store.recover(c
 
 See [`examples/basic.zig`](examples/basic.zig) for a full directory-shaped store driven end to end.
 
+### Scale writes: `ShardSet`
+
+A single `Store` serializes every write through one WAL-append lock, one apply mutex, the
+per-tree write lock, and one free-list mutex. `ShardSet` partitions an opaque keyspace across
+N independent `Store`s under one `data_dir`, each its own serialization domain, routed by
+`hash(key) % shard_count`:
+
+```zig
+const Set = zigstore.ShardSet(zigstore.Engine(schema));
+const set = try Set.init(allocator, .{ .data_dir = dir, .shard_count = 8 });
+defer set.deinit();
+
+const key = codec.encodeU64(id);
+try set.commit(Record, &key, op_code, record, serialize_fn, apply_fn); // routes by key
+const store = set.shardFor(&key);                                       // same shard for reads
+```
+
+`shard_count` is recorded in `shardset.meta` and a reopen with a different count fails rather
+than silently re-routing keys. The routing key must be the canonical key a record is stored
+and read under; counters are per-shard; a commit is atomic only within its shard; whole-keyspace
+range scans merge the shards. When the write path is **apply/lock-bound**, throughput scales with
+the shard count (≈5× at 8 shards, 8 fixed writer threads, on a 10-core box). When it is
+**`fdatasync`-bound on a single device**, the existing single-WAL group commit already amortizes
+the device and sharding does not help — the win needs apply-bound work or independent devices/nodes
+(the Tier-3b production shape in [`scale.md`](scale.md)). Measure your own workload:
+
+```bash
+zig build bench -- --indexes 4 --threads 8        # sweeps shards 1,2,4,8; see bench/write_bench.zig
+zig build bench -- --no-direct --dir /dev/shm/zsb # buffered WAL on tmpfs: isolate the apply-bound regime
+```
+
 ## Develop
 
 The repo ships a devcontainer that pins Zig 0.15.2 and ZLS:

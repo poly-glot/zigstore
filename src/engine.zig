@@ -282,6 +282,11 @@ pub fn Engine(comptime s: Schema) type {
             data_dir: []const u8,
             cache_size_mb: u32 = 64,
             wal_batch_size: u32 = 32,
+            /// Open the WAL with `O_DIRECT` (the default) or force buffered I/O. Set `false` on a
+            /// filesystem where `O_DIRECT` is unavailable or undesirable (NFS, some CSI volumes);
+            /// the WAL still `fdatasync`s for durability, it just skips direct I/O and its
+            /// block-aligned padding.
+            wal_direct_io: bool = true,
         };
 
         const Trees = TreesType(s);
@@ -369,7 +374,7 @@ pub fn Engine(comptime s: Schema) type {
                 log.warn("snapshot meta read failed: {} — WAL sequence resumes from 0", .{err});
                 break :blk 0;
             };
-            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, snapshot_base) catch |err| blk: {
+            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, snapshot_base, config.wal_direct_io) catch |err| blk: {
                 log.warn("WAL open failed: {} — continuing without WAL", .{err});
                 break :blk null;
             };
@@ -644,6 +649,19 @@ pub fn Engine(comptime s: Schema) type {
                 .last_applied_lsn = applied,
                 .durable_lsn = if (self.wal_writer) |*w| w.durableBoundary().sequence else 0,
             };
+        }
+
+        /// Whether this store's WAL opened with `O_DIRECT` or fell back to buffered I/O; `false`
+        /// when the store has no WAL. Lets a benchmark or operator report the real durability
+        /// mode rather than assume one.
+        pub fn walUsingDirectIo(self: *Store) bool {
+            return if (self.wal_writer) |*w| w.usingDirectIo() else false;
+        }
+
+        /// The count of `fdatasync` calls this store's WAL has completed (`0` without a WAL).
+        /// Divided into the commit count it gives the mean group-commit batch occupancy.
+        pub fn walFsyncCount(self: *Store) u64 {
+            return if (self.wal_writer) |*w| w.fsyncCount() else 0;
         }
 
         /// Clears the read-only flag so the store accepts commits. Fails with
@@ -929,7 +947,7 @@ test "recover: applies each WAL entry once, replays-hook once, bootstraps only w
 
     {
         const op_code: u8 = 1;
-        var w = try wal.WalWriter.init(allocator, dir, 32, 0);
+        var w = try wal.WalWriter.init(allocator, dir, 32, 0, true);
         defer w.deinit();
         _ = try w.append(op_code, "one");
         _ = try w.append(op_code, "two");
