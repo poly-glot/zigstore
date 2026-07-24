@@ -13,6 +13,16 @@ fn runReactor(reactor: *epoll.EpollServer) void {
     };
 }
 
+/// Optional lifecycle hooks for `run`, letting a consumer wire the reactor set into the store's
+/// deferred-response doorbell. `on_reactors_up` fires once, after the reactors exist and before any
+/// runs, to register a durability notifier that rings them. `on_reactors_down` fires once, after all
+/// reactors have stopped and BEFORE they are freed, to clear that notifier — so a late WAL-flusher
+/// or hub fire can never ring a freed reactor.
+pub const RunHooks = struct {
+    on_reactors_up: ?*const fn (ctx: *anyopaque, reactors: []*epoll.EpollServer) void = null,
+    on_reactors_down: ?*const fn (ctx: *anyopaque) void = null,
+};
+
 /// Generic server bootstrap: install signal handlers, spawn
 /// `max(config.thread_count / 2, 1)` epoll reactors over the opaque `ctx` and
 /// `handler`, run the primary reactor on the calling thread, and join the rest
@@ -23,6 +33,7 @@ pub fn run(
     ctx: *anyopaque,
     handler: epoll.Handler,
     config: ServerConfig,
+    hooks: RunHooks,
 ) !void {
     _ = Store;
     const allocator = std.heap.page_allocator;
@@ -40,6 +51,9 @@ pub fn run(
         for (reactors) |r| r.destroy();
         allocator.free(reactors);
     }
+
+    if (hooks.on_reactors_up) |up| up(ctx, reactors);
+    defer if (hooks.on_reactors_down) |down| down(ctx);
 
     var reactor_threads = try allocator.alloc(std.Thread, num_reactors - 1);
     defer allocator.free(reactor_threads);

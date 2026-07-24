@@ -159,6 +159,15 @@ pub const WalWriter = struct {
         self.notifier = n;
     }
 
+    /// Removes the durability listener under the lock. Because `publishDurable`/`publishFailure`
+    /// fire the notifier while holding the same lock, once this returns no in-flight fire is
+    /// running and none will start — the safe teardown barrier before the listener is freed.
+    pub fn clearNotifier(self: *WalWriter) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.notifier = null;
+    }
+
     /// The published durable watermark — a lock-free mirror of `last_durable_seq` for parked
     /// commits to poll on wakeup. Monotonic; may lag the locked value by one release.
     pub fn durableSeqPublished(self: *const WalWriter) u64 {

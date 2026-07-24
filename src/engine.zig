@@ -696,6 +696,45 @@ pub fn Engine(comptime s: Schema) type {
             return &self.sync_gate;
         }
 
+        /// Registers the deferred-response durability listener on both the WAL and the
+        /// store-owned quorum gate — the doorbell rung when durability or quorum advances (or a
+        /// flush fails). The async server layer passes a notifier that wakes every reactor. The
+        /// gate object persists across hub restarts, so registering once at boot is sufficient.
+        pub fn setDeferredNotifier(self: *Store, n: wal.DurabilityNotifier) void {
+            if (self.wal_writer) |*w| w.setNotifier(n);
+            self.sync_gate.setNotifier(n);
+        }
+
+        /// Removes the deferred-response listener from the WAL and gate under their locks — the
+        /// teardown barrier the server layer calls after its reactors stop and before they (the
+        /// listener's target) are freed, so a late flusher/hub fire can never touch freed memory.
+        pub fn clearDeferredNotifier(self: *Store) void {
+            if (self.wal_writer) |*w| w.clearNotifier();
+            self.sync_gate.clearNotifier();
+        }
+
+        /// The published (lock-free) durable WAL watermark for a parked commit's release check.
+        pub fn durableSeqPublished(self: *Store) u64 {
+            return if (self.wal_writer) |*w| w.durableSeqPublished() else 0;
+        }
+
+        /// Whether the WAL has permanently failed a flush — a parked commit past the failure
+        /// boundary must be failed, never released as durable.
+        pub fn flushFailedPublished(self: *Store) bool {
+            return if (self.wal_writer) |*w| w.flushFailedPublished() else false;
+        }
+
+        /// The published quorum watermark of the store-owned gate (0 when no quorum has acked).
+        pub fn quorumWatermarkPublished(self: *Store) u64 {
+            return self.sync_gate.watermarkPublished();
+        }
+
+        /// Whether the store-owned quorum gate is closed (replication stopped) — a parked money
+        /// op that owes quorum must be failed so its client retries once replication returns.
+        pub fn quorumClosedPublished(self: *Store) bool {
+            return self.sync_gate.closedPublished();
+        }
+
         /// The `replication.PrimaryHost` view of this store for `Hub.start`: its WAL
         /// writer, data directory, and snapshot host (so the hub can serve base backups).
         /// Fails with `error.WalDisabled` when the store opened without a WAL. The interior

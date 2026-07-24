@@ -105,6 +105,14 @@ pub const CommitGate = struct {
         self.notifier = n;
     }
 
+    /// Removes the quorum listener under the mutex — the safe teardown barrier (advance/close fire
+    /// the notifier while holding this mutex, so no in-flight fire survives this call).
+    pub fn clearNotifier(self: *CommitGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.notifier = null;
+    }
+
     /// The published quorum watermark — a lock-free mirror for parked commits to poll on wakeup.
     pub fn watermarkPublished(self: *const CommitGate) u64 {
         return self.watermark_pub.load(.acquire);

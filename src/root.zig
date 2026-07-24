@@ -97,6 +97,7 @@ pub const ServerConfig = @import("server_config.zig").ServerConfig;
 pub const EpollServer = @import("epoll.zig").EpollServer;
 pub const Handler = @import("epoll.zig").Handler;
 pub const run = @import("run.zig").run;
+pub const RunHooks = @import("run.zig").RunHooks;
 
 test {
     _ = @import("codec.zig");
