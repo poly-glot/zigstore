@@ -77,7 +77,16 @@ pub const WalWriter = struct {
     flush_failed_pub: std.atomic.Value(bool),
     notifier: ?DurabilityNotifier,
 
-    pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool) !WalWriter {
+    // v1.5.0 fsync-pipelining (Stage 1: resolved but the flusher runs depth-1 until Stage 2).
+    // 1 = the legacy serial flusher, byte-identical to v1.4.0 and the kill-switch.
+    flush_depth: u32,
+    // Stage 0 instrumentation: total appended entries (appends_total / fsync_count = mean group-commit
+    // batch occupancy) and the peak concurrent-flush high water (0/1 at depth-1, >1 once Stage 2 lands).
+    appends_total: std.atomic.Value(u64),
+    flushes_in_flight: std.atomic.Value(u32),
+    max_flushes_in_flight: std.atomic.Value(u32),
+
+    pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool, flush_depth: u32) !WalWriter {
         const path = try std.fs.path.join(allocator, &.{ dir, "wal.bin" });
         defer allocator.free(path);
 
@@ -145,6 +154,10 @@ pub const WalWriter = struct {
             .truncation_epoch = 0,
             .retain_floor = std.atomic.Value(u64).init(std.math.maxInt(u64)),
             .fsync_count = std.atomic.Value(u64).init(0),
+            .flush_depth = if (!want_direct_io or flush_depth == 0) 1 else flush_depth,
+            .appends_total = std.atomic.Value(u64).init(0),
+            .flushes_in_flight = std.atomic.Value(u32).init(0),
+            .max_flushes_in_flight = std.atomic.Value(u32).init(0),
             .durable_seq_pub = std.atomic.Value(u64).init(@max(scan.last_sequence, base_sequence)),
             .flush_failed_pub = std.atomic.Value(bool).init(false),
             .notifier = null,
@@ -270,6 +283,7 @@ pub const WalWriter = struct {
 
         self.entry_count += 1;
         self.pending_max_seq = seq;
+        _ = self.appends_total.fetchAdd(1, .monotonic);
 
         if (self.entry_count >= self.batch_size) {
             self.flush_cond.signal();
@@ -338,6 +352,24 @@ pub const WalWriter = struct {
         return self.fsync_count.load(.monotonic);
     }
 
+    /// Total entries appended since open. `appendsTotal() / fsyncCount()` is the mean group-commit
+    /// batch occupancy — the number the fsync-pipeline lifts (from ~2 at the reactor cap toward the
+    /// batch size). A Stage-0 metric with meaning at depth-1 and depth-N alike.
+    pub fn appendsTotal(self: *const WalWriter) u64 {
+        return self.appends_total.load(.monotonic);
+    }
+
+    /// Peak concurrent in-flight `fdatasync` calls observed — 1 at depth-1, up to `flush_depth`
+    /// once the Stage-2 pipeline lands. The direct read of whether pipelining is actually engaged.
+    pub fn maxFlushesInFlight(self: *const WalWriter) u32 {
+        return self.max_flushes_in_flight.load(.monotonic);
+    }
+
+    /// The resolved flush pipeline depth (1 = the legacy serial flusher / kill-switch).
+    pub fn flushDepth(self: *const WalWriter) u32 {
+        return self.flush_depth;
+    }
+
     fn swapAndFlush(self: *WalWriter) !void {
         while (self.back_in_flight) {
             self.flush_done_cond.wait(&self.lock);
@@ -395,6 +427,13 @@ pub const WalWriter = struct {
             try self.file.writeAll(self.back.items);
             self.write_offset += self.back.items.len;
         }
+
+        const in_flight = self.flushes_in_flight.fetchAdd(1, .monotonic) + 1;
+        var hw = self.max_flushes_in_flight.load(.monotonic);
+        while (in_flight > hw) {
+            hw = self.max_flushes_in_flight.cmpxchgWeak(hw, in_flight, .monotonic, .monotonic) orelse break;
+        }
+        defer _ = self.flushes_in_flight.fetchSub(1, .monotonic);
 
         try posix.fdatasync(self.file.handle);
         _ = self.fsync_count.fetchAdd(1, .monotonic);
@@ -589,7 +628,7 @@ pub const WalWriter = struct {
 
 fn initHeap(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64) !*WalWriter {
     const w = try allocator.create(WalWriter);
-    w.* = try WalWriter.init(allocator, dir, batch_size, base_sequence, true);
+    w.* = try WalWriter.init(allocator, dir, batch_size, base_sequence, true, 1);
     try w.startFlusher();
     return w;
 }
@@ -617,6 +656,38 @@ test "append entries and verify sequence" {
     try std.testing.expectEqual(@as(u64, 2), seq2);
     try std.testing.expectEqual(@as(u64, 3), seq3);
     try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
+}
+
+test "stage-0 metrics: appends_total, occupancy, depth-1 in-flight high water" {
+    const tmp_dir = "/tmp/wal_test_metrics";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
+    defer deinitHeap(writer);
+
+    try std.testing.expectEqual(@as(u32, 1), writer.flushDepth());
+    _ = try writer.append(test_op, "a");
+    _ = try writer.append(test_op, "b");
+    _ = try writer.append(test_op, "c");
+    try writer.sync();
+
+    try std.testing.expectEqual(@as(u64, 3), writer.appendsTotal());
+    try std.testing.expect(writer.fsyncCount() >= 1);
+    // depth-1: at most one fdatasync ever concurrent.
+    try std.testing.expectEqual(@as(u32, 1), writer.maxFlushesInFlight());
+}
+
+test "stage-1 kill-switch: buffered mode forces depth-1 regardless of requested depth" {
+    const tmp_dir = "/tmp/wal_test_depth_clamp";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    var w = try WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, false, 16);
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 1), w.flushDepth());
 }
 
 test "sync flushes to disk" {
@@ -1035,7 +1106,7 @@ test "init propagates a scan failure instead of truncating the WAL" {
     var fail_index: usize = 0;
     while (fail_index < 16) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var writer = WalWriter.init(failing.allocator(), tmp_dir, 32, 0, true) catch {
+        var writer = WalWriter.init(failing.allocator(), tmp_dir, 32, 0, true, 1) catch {
             saw_failure = true;
             continue;
         };

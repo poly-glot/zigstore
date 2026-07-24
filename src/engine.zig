@@ -287,6 +287,11 @@ pub fn Engine(comptime s: Schema) type {
             /// the WAL still `fdatasync`s for durability, it just skips direct I/O and its
             /// block-aligned padding.
             wal_direct_io: bool = true,
+            /// WAL fsync-pipeline depth (v1.5.0). 1 (default) = the legacy serial flusher, the
+            /// kill-switch; >1 overlaps up to N `fdatasync`s to lift the durable-write ceiling on
+            /// latency-bound storage. Forced to 1 without `wal_direct_io`. The pipeline itself lands
+            /// in Stage 2 — until then the depth is resolved and reported but the flusher runs serial.
+            wal_flush_depth: u32 = 1,
         };
 
         const Trees = TreesType(s);
@@ -374,7 +379,7 @@ pub fn Engine(comptime s: Schema) type {
                 log.warn("snapshot meta read failed: {} — WAL sequence resumes from 0", .{err});
                 break :blk 0;
             };
-            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, snapshot_base, config.wal_direct_io) catch |err| blk: {
+            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, snapshot_base, config.wal_direct_io, config.wal_flush_depth) catch |err| blk: {
                 log.warn("WAL open failed: {} — continuing without WAL", .{err});
                 break :blk null;
             };
@@ -662,6 +667,23 @@ pub fn Engine(comptime s: Schema) type {
         /// Divided into the commit count it gives the mean group-commit batch occupancy.
         pub fn walFsyncCount(self: *Store) u64 {
             return if (self.wal_writer) |*w| w.fsyncCount() else 0;
+        }
+
+        /// Total WAL entries appended; `walAppendsTotal() / walFsyncCount()` is the mean group-commit
+        /// batch occupancy (the number the fsync-pipeline lifts). 0 without a WAL.
+        pub fn walAppendsTotal(self: *Store) u64 {
+            return if (self.wal_writer) |*w| w.appendsTotal() else 0;
+        }
+
+        /// Peak concurrent in-flight `fdatasync`s observed (1 at depth-1, up to the flush depth once
+        /// the Stage-2 pipeline engages) — whether pipelining is actually running. 0 without a WAL.
+        pub fn walMaxFlushesInFlight(self: *Store) u32 {
+            return if (self.wal_writer) |*w| w.maxFlushesInFlight() else 0;
+        }
+
+        /// The resolved WAL fsync-pipeline depth (1 = serial flusher / kill-switch). 0 without a WAL.
+        pub fn walFlushDepth(self: *Store) u32 {
+            return if (self.wal_writer) |*w| w.flushDepth() else 0;
         }
 
         /// Clears the read-only flag so the store accepts commits. Fails with
@@ -986,7 +1008,7 @@ test "recover: applies each WAL entry once, replays-hook once, bootstraps only w
 
     {
         const op_code: u8 = 1;
-        var w = try wal.WalWriter.init(allocator, dir, 32, 0, true);
+        var w = try wal.WalWriter.init(allocator, dir, 32, 0, true, 1);
         defer w.deinit();
         _ = try w.append(op_code, "one");
         _ = try w.append(op_code, "two");

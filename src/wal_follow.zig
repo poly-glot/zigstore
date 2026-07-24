@@ -196,7 +196,7 @@ const test_op: u8 = 100;
 
 fn initWriter(dir: []const u8) !*wal.WalWriter {
     const w = try std.testing.allocator.create(wal.WalWriter);
-    w.* = try wal.WalWriter.init(std.testing.allocator, dir, 32, 0, true);
+    w.* = try wal.WalWriter.init(std.testing.allocator, dir, 32, 0, true, 1);
     try w.startFlusher();
     return w;
 }
