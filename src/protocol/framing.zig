@@ -223,10 +223,19 @@ fn pipelineHasRoom(resp_off: usize, buf_len: usize, response_reserve: usize) boo
 /// at least `response_reserve`, so `dispatch_fn` always receives a slice large
 /// enough for any single response the caller can produce; a frame that would not
 /// fit is deferred and emitted on the next drain at `resp_off == 0`.
+/// Per-frame durability gate a `dispatch_fn` fills in deferred-response mode: `seq` is the WAL
+/// sequence the response must wait on (0 = no wait, the synchronous default), `needs_quorum` marks
+/// a money op that must also clear the quorum watermark. `processFrames` folds the batch to the
+/// strictest gate — one release point per pipelined batch — and writes it onto the connection.
+pub const FrameGate = struct {
+    seq: u64 = 0,
+    needs_quorum: bool = false,
+};
+
 pub fn processFrames(
     ctx: *anyopaque,
     conn: *connection.Connection,
-    dispatch_fn: *const fn (ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize,
+    dispatch_fn: *const fn (ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8, gate: *FrameGate) usize,
     op_latency: *[256]histogram.AtomicHistogram,
     response_reserve: usize,
 ) void {
@@ -234,6 +243,8 @@ pub fn processFrames(
     const data = bp.request_buf[0..conn.bytes_read];
     var consumed: usize = 0;
     var resp_off: usize = 0;
+    var batch_durable_seq: u64 = 0;
+    var batch_quorum_seq: u64 = 0;
 
     while (consumed + REQUEST_HEADER_SIZE <= data.len) {
         if (!pipelineHasRoom(resp_off, bp.response_buf.len, response_reserve)) break;
@@ -255,8 +266,9 @@ pub fn processFrames(
         const count = std.mem.readInt(u16, frame[6..8], .little);
         const payload = frame[REQUEST_HEADER_SIZE..total_len];
 
+        var gate = FrameGate{};
         const t0 = std.time.nanoTimestamp();
-        const written = dispatch_fn(ctx, op_byte, payload, count, bp.response_buf[resp_off..]);
+        const written = dispatch_fn(ctx, op_byte, payload, count, bp.response_buf[resp_off..], &gate);
         const t1 = std.time.nanoTimestamp();
         const dt: u64 = if (t1 > t0) @intCast(t1 - t0) else 0;
         op_latency[op_byte].recordValue(dt);
@@ -264,6 +276,9 @@ pub fn processFrames(
         if (written == 0) break;
         resp_off += written;
         consumed += total_len;
+
+        if (gate.seq > batch_durable_seq) batch_durable_seq = gate.seq;
+        if (gate.needs_quorum and gate.seq > batch_quorum_seq) batch_quorum_seq = gate.seq;
     }
 
     if (consumed > 0) {
@@ -275,6 +290,8 @@ pub fn processFrames(
     }
 
     conn.response_len = resp_off;
+    conn.gate_durable_seq = batch_durable_seq;
+    conn.gate_quorum_seq = batch_quorum_seq;
 }
 
 const echo_fields = &[_]struct { []const u8, type }{
@@ -350,7 +367,8 @@ const EchoCtx = struct {
     last_op: u8 = 0,
 };
 
-fn echoDispatch(ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+fn echoDispatch(ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8, gate: *FrameGate) usize {
+    _ = gate;
     const self: *EchoCtx = @ptrCast(@alignCast(ctx));
     self.dispatch_calls += 1;
     self.last_op = op_byte;
@@ -431,7 +449,7 @@ const TruncatingCtx = struct {
     rows: [ROW_LIST_ITEMS]RowRecord = undefined,
 };
 
-fn truncatingDispatch(ctx: *anyopaque, op_byte: u8, _: []const u8, _: u16, resp: []u8) usize {
+fn truncatingDispatch(ctx: *anyopaque, op_byte: u8, _: []const u8, _: u16, resp: []u8, _: *FrameGate) usize {
     const self: *TruncatingCtx = @ptrCast(@alignCast(ctx));
     self.dispatch_calls += 1;
     if (op_byte == ROW_LIST_OP) {
