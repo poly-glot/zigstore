@@ -11,6 +11,7 @@ const log = std.log.scoped(.epoll);
 
 pub const MAX_CONNECTIONS = 4096;
 const MAX_EVENTS = 64;
+const PARKED_POLL_MS: i32 = 25;
 
 pub const BUFFER_POOL_SIZE: u16 = 256;
 
@@ -26,10 +27,36 @@ const CONNECTION_TIMEOUT_S: i64 = 30;
 ///     this many bytes have arrived.
 ///   - `on_shutdown` (optional): invoked once with `ctx` when the primary
 ///     reactor's event loop exits, for the application to flush durable state.
+/// The verdict for a parked connection whose response is staged but withheld pending durability.
+pub const ReleaseVerdict = enum {
+    /// The gate is not yet satisfied — keep the connection parked.
+    wait,
+    /// Durability (and quorum, if owed) reached the gate — write the staged response.
+    release,
+    /// Durability can never reach the gate (a flush failed below it) — close the connection.
+    /// The consumer's clients must retry idempotently; the applied entry is not lost, only its ack.
+    fail,
+};
+
+/// The application-supplied protocol hooks the reactor drives per connection.
+///
+///   - `process_frames`: decode the connection's buffered request bytes and
+///     write framed responses, setting `conn.response_len`. In deferred-response
+///     mode it also sets `conn.gate_durable_seq` (and `gate_quorum_seq`) non-zero
+///     to have the reactor withhold the response until `release_check` clears it.
+///   - `header_size`: the minimum number of buffered bytes before a request
+///     frame's length is known; the reactor calls `process_frames` only once
+///     this many bytes have arrived.
+///   - `on_shutdown` (optional): invoked once with `ctx` when the primary
+///     reactor's event loop exits, for the application to flush durable state.
+///   - `release_check` (optional): the reactor calls it for each parked
+///     connection when its doorbell rings, to decide whether the staged
+///     response may now be written. Null means the consumer never parks.
 pub const Handler = struct {
     process_frames: *const fn (ctx: *anyopaque, conn: *connection.Connection) void,
     header_size: usize,
     on_shutdown: ?*const fn (ctx: *anyopaque) void = null,
+    release_check: ?*const fn (ctx: *anyopaque, gate_durable_seq: u64, gate_quorum_seq: u64) ReleaseVerdict = null,
 };
 
 pub const EpollServer = struct {
@@ -39,6 +66,8 @@ pub const EpollServer = struct {
     config: ServerConfig,
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
+    doorbell_fd: posix.fd_t,
+    parked_count: u32 = 0,
     connections: [MAX_CONNECTIONS]connection.Connection,
 
     fd_to_slot: std.AutoHashMap(posix.fd_t, u16),
@@ -108,6 +137,14 @@ pub const EpollServer = struct {
             }
         }
 
+        const doorbell_fd: posix.fd_t = @intCast(std.os.linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC));
+        errdefer posix.close(doorbell_fd);
+        var doorbell_event = linux.epoll_event{
+            .events = linux.EPOLL.IN,
+            .data = .{ .fd = doorbell_fd },
+        };
+        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, doorbell_fd, &doorbell_event);
+
         const buf_pool_size: u32 = @max(BUFFER_POOL_SIZE, config.thread_count * 64);
         const buffer_pairs = try allocator.alloc(connection.BufferPair, buf_pool_size);
         errdefer allocator.free(buffer_pairs);
@@ -126,6 +163,8 @@ pub const EpollServer = struct {
         server.config = config;
         server.epoll_fd = epoll_fd;
         server.listen_fd = listen_fd;
+        server.doorbell_fd = doorbell_fd;
+        server.parked_count = 0;
         server.buffer_pairs = buffer_pairs;
         server.free_stack = buf_free_stack;
         server.buf_pool_size = buf_pool_size;
@@ -171,6 +210,7 @@ pub const EpollServer = struct {
 
         posix.close(self.epoll_fd);
         posix.close(self.listen_fd);
+        posix.close(self.doorbell_fd);
         signal.closeShutdownPipe();
 
         self.fd_to_slot.deinit();
@@ -190,7 +230,8 @@ pub const EpollServer = struct {
         log.info("Entering event loop", .{});
 
         while (!signal.shutdownRequested()) {
-            const n = posix.epoll_wait(self.epoll_fd, &events, 1000);
+            const timeout_ms: i32 = if (self.parked_count > 0) PARKED_POLL_MS else 1000;
+            const n = posix.epoll_wait(self.epoll_fd, &events, timeout_ms);
 
             self.binary_write_count = 0;
             var got_shutdown = false;
@@ -204,6 +245,8 @@ pub const EpollServer = struct {
                     log.info("Shutdown signal received via pipe", .{});
                     got_shutdown = true;
                     break;
+                } else if (fd == self.doorbell_fd) {
+                    self.drainDoorbell();
                 } else {
                     self.handleEvent(fd, ev.events);
                 }
@@ -211,6 +254,8 @@ pub const EpollServer = struct {
             if (got_shutdown) break;
 
             self.flushBinaryWrites();
+
+            if (self.parked_count > 0) self.releaseParked();
 
             self.sweepIdleConnections();
         }
@@ -316,10 +361,15 @@ pub const EpollServer = struct {
             conn.last_activity = std.time.timestamp();
             if (self.drainAndProcess(fd, conn)) return;
             if (conn.response_len > 0) {
-                conn.bytes_written = 0;
-                conn.phase = .writing_response;
-                self.binary_write_fds[self.binary_write_count] = fd;
-                self.binary_write_count += 1;
+                if (conn.gate_durable_seq != 0) {
+                    conn.phase = .awaiting_durability;
+                    self.parked_count += 1;
+                } else {
+                    conn.bytes_written = 0;
+                    conn.phase = .writing_response;
+                    self.binary_write_fds[self.binary_write_count] = fd;
+                    self.binary_write_count += 1;
+                }
             }
         }
 
@@ -335,6 +385,47 @@ pub const EpollServer = struct {
             self.finishBinaryWrite(fd, conn);
         }
         self.binary_write_count = 0;
+    }
+
+    fn drainDoorbell(self: *Self) void {
+        var buf: [8]u8 = undefined;
+        while (true) {
+            _ = posix.read(self.doorbell_fd, &buf) catch break;
+        }
+    }
+
+    /// Writes to this reactor's doorbell eventfd — the durability listener's wakeup. Safe to call
+    /// from any thread (a single `write` of 8 bytes to an `EFD_NONBLOCK` eventfd is atomic and
+    /// never blocks; a saturated counter simply coalesces).
+    pub fn ringDoorbell(self: *Self) void {
+        const one: u64 = 1;
+        _ = posix.write(self.doorbell_fd, std.mem.asBytes(&one)) catch {};
+    }
+
+    /// Scans parked connections and releases (or fails) each whose gate the handler now clears.
+    /// Called only at the top of the run loop — never nested inside a write — so `finishBinaryWrite`
+    /// re-drain/re-park transitions stay well-defined.
+    fn releaseParked(self: *Self) void {
+        const check = self.handler.release_check orelse return;
+        for (&self.connections) |*conn| {
+            if (conn.phase != .awaiting_durability) continue;
+            const fd = conn.fd;
+            switch (check(self.ctx, conn.gate_durable_seq, conn.gate_quorum_seq)) {
+                .wait => {},
+                .release => {
+                    conn.gate_durable_seq = 0;
+                    conn.gate_quorum_seq = 0;
+                    conn.bytes_written = 0;
+                    conn.phase = .writing_response;
+                    self.parked_count -= 1;
+                    self.finishBinaryWrite(fd, conn);
+                },
+                .fail => {
+                    self.parked_count -= 1;
+                    self.closeConnection(fd);
+                },
+            }
+        }
     }
 
     fn drainAndProcess(self: *Self, fd: posix.fd_t, conn: *connection.Connection) bool {
@@ -391,6 +482,15 @@ pub const EpollServer = struct {
 
             if (self.drainAndProcess(fd, conn)) return;
             if (conn.response_len > 0) {
+                if (conn.gate_durable_seq != 0) {
+                    if (conn.armed_for_write) {
+                        self.armForRead(conn);
+                        conn.armed_for_write = false;
+                    }
+                    conn.phase = .awaiting_durability;
+                    self.parked_count += 1;
+                    return;
+                }
                 conn.bytes_written = 0;
                 conn.phase = .writing_response;
                 continue;
@@ -409,6 +509,7 @@ pub const EpollServer = struct {
 
         if (self.fd_to_slot.get(fd)) |slot_idx| {
             const conn = &self.connections[slot_idx];
+            if (conn.phase == .awaiting_durability) self.parked_count -= 1;
             if (conn.buf) |bp| self.releaseBuffer(bp);
             conn.reset();
             self.returnSlot(slot_idx);

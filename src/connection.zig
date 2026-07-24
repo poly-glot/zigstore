@@ -5,6 +5,11 @@ pub const Phase = enum(u8) {
     empty,
     reading_request,
     writing_response,
+    /// The response bytes are staged in response_buf but withheld until the WAL's durable
+    /// watermark (and, when gate_quorum_seq != 0, the quorum watermark) reach the connection's
+    /// gate. Deferred-response mode only; excluded from the idle sweep. The owning reactor is
+    /// single-threaded, so no other thread ever touches a parked connection.
+    awaiting_durability,
 };
 
 pub const REQUEST_BUF_SIZE = 65536;
@@ -24,6 +29,8 @@ pub const Connection = struct {
     response_len: usize = 0,
     last_activity: i64 = 0,
     armed_for_write: bool = false,
+    gate_durable_seq: u64 = 0,
+    gate_quorum_seq: u64 = 0,
 
     pub fn reset(self: *Connection) void {
         self.fd = -1;
@@ -34,6 +41,8 @@ pub const Connection = struct {
         self.response_len = 0;
         self.last_activity = 0;
         self.armed_for_write = false;
+        self.gate_durable_seq = 0;
+        self.gate_quorum_seq = 0;
     }
 
     pub fn isActive(self: *const Connection) bool {
