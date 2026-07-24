@@ -16,6 +16,11 @@ pub const CommitOptions = struct {
     /// gate is installed — for writes whose loss on an un-acked-leader crash carries no cost and
     /// must not pay the cross-node ack latency.
     await_quorum: bool = true,
+    /// Upper bound on the quorum wait, in nanoseconds. 0 (the default) means no deadline — the
+    /// historical unbounded behaviour. When exceeded, `commitSeq` fails with `error.QuorumTimeout`;
+    /// the entry is already leader-durable and applied and will replicate once a follower returns,
+    /// so the caller treats the timeout as retryable/degraded, never as data loss.
+    quorum_timeout_ns: u64 = 0,
 };
 
 /// Append `record` to the WAL under op code `op_code`, apply it in WAL-sequence order, wait
@@ -75,7 +80,7 @@ pub fn commitSeq(
 
     if (options.await_quorum) {
         if (store.commit_gate.load(.acquire)) |gate| {
-            try gate.awaitQuorum(seq);
+            try gate.awaitQuorumTimeout(seq, options.quorum_timeout_ns);
         }
     }
 

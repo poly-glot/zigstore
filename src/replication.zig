@@ -129,6 +129,31 @@ pub const CommitGate = struct {
         }
     }
 
+    /// Blocks until the watermark reaches `lsn`, the gate closes, or `timeout_ns` elapses.
+    /// `error.QuorumTimeout` is distinct from `error.ReplicationStopped`: on timeout the entry
+    /// is already leader-durable AND applied and WILL replicate once a follower reattaches — the
+    /// caller decides whether to surface it as retryable. A `timeout_ns` of 0 means no deadline
+    /// (identical to `awaitQuorum`).
+    pub fn awaitQuorumTimeout(self: *CommitGate, lsn: u64, timeout_ns: u64) error{ ReplicationStopped, QuorumTimeout }!void {
+        if (timeout_ns == 0) return self.awaitQuorum(lsn);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var timer = std.time.Timer.start() catch return self.awaitQuorumUnbounded(lsn);
+        while (self.watermark < lsn) {
+            if (self.closed) return error.ReplicationStopped;
+            const elapsed = timer.read();
+            if (elapsed >= timeout_ns) return error.QuorumTimeout;
+            self.cond.timedWait(&self.mutex, timeout_ns - elapsed) catch {};
+        }
+    }
+
+    fn awaitQuorumUnbounded(self: *CommitGate, lsn: u64) error{ ReplicationStopped, QuorumTimeout }!void {
+        while (self.watermark < lsn) {
+            if (self.closed) return error.ReplicationStopped;
+            self.cond.wait(&self.mutex);
+        }
+    }
+
     /// The current quorum-acked LSN.
     pub fn current(self: *CommitGate) u64 {
         self.mutex.lock();
@@ -329,6 +354,7 @@ pub const Hub = struct {
     }
 
     fn handleConnection(self: *Hub, fd: posix.socket_t) void {
+        setNoDelay(fd);
         setSockTimeout(fd, posix.SO.RCVTIMEO, HANDSHAKE_TIMEOUT_MS);
         setSockTimeout(fd, posix.SO.SNDTIMEO, self.cfg.ack_timeout_ms);
 
@@ -753,6 +779,7 @@ pub const Receiver = struct {
                 self.backoffSleep(&backoff);
                 continue;
             };
+            setNoDelay(stream.handle);
             self.setFd(stream.handle);
 
             const result = self.session(stream.handle);
@@ -1055,6 +1082,11 @@ fn setSockTimeout(fd: posix.socket_t, opt: u32, ms: u64) void {
 fn setSockTimeouts(fd: posix.socket_t, ms: u64) void {
     setSockTimeout(fd, posix.SO.RCVTIMEO, ms);
     setSockTimeout(fd, posix.SO.SNDTIMEO, ms);
+}
+
+fn setNoDelay(fd: posix.socket_t) void {
+    const one: c_int = 1;
+    posix.setsockopt(fd, posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 }
 
 fn buildReplicaName(replica_name: []const u8) error{ReplicaNameTooLong}![REPLICA_NAME_LEN]u8 {
@@ -1519,6 +1551,41 @@ test "CommitGate advances monotonically, releases waiters, and fails closed" {
     try std.testing.expectEqual(@as(?error{ReplicationStopped}, error.ReplicationStopped), stopped.result);
 
     try std.testing.expectError(error.ReplicationStopped, gate.awaitQuorum(11));
+}
+
+test "awaitQuorumTimeout: satisfied returns, unmet times out, zero means unbounded, closed still wins" {
+    var gate = CommitGate{};
+
+    gate.advance(5);
+    try gate.awaitQuorumTimeout(5, 10 * std.time.ns_per_ms);
+
+    const start = try std.time.Timer.start();
+    var timer = start;
+    try std.testing.expectError(error.QuorumTimeout, gate.awaitQuorumTimeout(9, 20 * std.time.ns_per_ms));
+    try std.testing.expect(timer.read() >= 15 * std.time.ns_per_ms);
+
+    const Bg = struct {
+        gate: *CommitGate,
+        fn advanceLate(self: *@This()) void {
+            std.Thread.sleep(15 * std.time.ns_per_ms);
+            self.gate.advance(9);
+        }
+        fn closeLate(self: *@This()) void {
+            std.Thread.sleep(15 * std.time.ns_per_ms);
+            self.gate.close();
+        }
+    };
+
+    var adv = Bg{ .gate = &gate };
+    const t1 = try std.Thread.spawn(.{}, Bg.advanceLate, .{&adv});
+    try gate.awaitQuorumTimeout(9, 0);
+    t1.join();
+
+    gate.advance(9);
+    var clo = Bg{ .gate = &gate };
+    const t2 = try std.Thread.spawn(.{}, Bg.closeLate, .{&clo});
+    try std.testing.expectError(error.ReplicationStopped, gate.awaitQuorumTimeout(50, 5 * std.time.ns_per_s));
+    t2.join();
 }
 
 test "promote refuses while the receiver is streaming" {
