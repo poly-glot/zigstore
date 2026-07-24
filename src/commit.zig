@@ -21,6 +21,24 @@ pub const CommitOptions = struct {
     /// the entry is already leader-durable and applied and will replicate once a follower returns,
     /// so the caller treats the timeout as retryable/degraded, never as data loss.
     quorum_timeout_ns: u64 = 0,
+    /// When set, `commitSeq` appends and applies synchronously (identical ordering) but does NOT
+    /// wait for durability or quorum — it fills the completion with the assigned seq and whether a
+    /// quorum wait is owed, then returns. The caller (the async server layer) parks the response
+    /// and releases it when the WAL's published durable watermark — and, if `needs_quorum`, the
+    /// gate's published watermark — reach `seq`. Null (the default) is the historical synchronous
+    /// path. The record is durable exactly as in the synchronous path (append happened); only the
+    /// WAIT moves off the calling thread.
+    completion: ?*CommitCompletion = null,
+};
+
+/// Filled by `commitSeq` when `CommitOptions.completion` is set: the assigned WAL sequence and
+/// whether the entry still owes a quorum wait (a gate was installed and `await_quorum` was true).
+/// The async server layer keys a parked response on `seq` and releases it once durability — and,
+/// when `needs_quorum`, quorum — reaches it. Local durability must be satisfied before the quorum
+/// watermark is consulted at release time, preserving the synchronous path's ordering.
+pub const CommitCompletion = struct {
+    seq: u64 = 0,
+    needs_quorum: bool = false,
 };
 
 /// Append `record` to the WAL under op code `op_code`, apply it in WAL-sequence order, wait
@@ -72,6 +90,14 @@ pub fn commitSeq(
         store.last_applied_seq = seq;
         store.apply_cond.broadcast();
         try apply_result;
+    }
+
+    if (options.completion) |completion| {
+        completion.* = .{
+            .seq = seq,
+            .needs_quorum = options.await_quorum and store.commit_gate.load(.acquire) != null,
+        };
+        return seq;
     }
 
     if (store.wal_writer) |*w| {
@@ -245,4 +271,36 @@ test "commitSeq await_quorum=false skips an installed gate that commit blocks on
 
     const relaxed_seq = try commitSeq(TestRecord, store, 1, .{ .id = 2, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{ .await_quorum = false });
     try std.testing.expectEqual(store.last_applied_seq, relaxed_seq);
+}
+
+test "completion path: applies synchronously, returns without waiting, records the quorum need" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    defer store.deinit();
+
+    var c1 = CommitCompletion{};
+    const s1 = try commitSeq(TestRecord, store, 1, .{ .id = 1, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{ .completion = &c1 });
+    try std.testing.expectEqual(s1, c1.seq);
+    try std.testing.expectEqual(false, c1.needs_quorum);
+    try std.testing.expectEqual(s1, store.last_applied_seq);
+
+    const gate = store.syncGate();
+    store.setCommitGate(gate);
+    gate.close();
+
+    var c2 = CommitCompletion{};
+    const s2 = try commitSeq(TestRecord, store, 1, .{ .id = 2, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{ .completion = &c2 });
+    try std.testing.expectEqual(s2, c2.seq);
+    try std.testing.expectEqual(true, c2.needs_quorum);
+    try std.testing.expectEqual(s2, store.last_applied_seq);
+
+    var c3 = CommitCompletion{};
+    const s3 = try commitSeq(TestRecord, store, 1, .{ .id = 3, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{ .completion = &c3, .await_quorum = false });
+    try std.testing.expectEqual(false, c3.needs_quorum);
+    try std.testing.expectEqual(s3, store.last_applied_seq);
 }

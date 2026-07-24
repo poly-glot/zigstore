@@ -32,6 +32,19 @@ pub const DurableBoundary = struct {
     truncation_epoch: u64,
 };
 
+/// A cheap, non-blocking listener the WAL fires whenever durability advances or a flush fails.
+/// The async server layer registers one whose `notify` writes to per-reactor eventfds, so a parked
+/// commit is woken without any thread blocking in `awaitDurable`. `notify` runs while the WAL lock
+/// is held and MUST NOT block (an `EFD_NONBLOCK` eventfd write is the intended implementation).
+pub const DurabilityNotifier = struct {
+    ctx: *anyopaque,
+    notify_fn: *const fn (ctx: *anyopaque) void,
+
+    pub fn fire(self: DurabilityNotifier) void {
+        self.notify_fn(self.ctx);
+    }
+};
+
 pub const WalWriter = struct {
     file: std.fs.File,
     sequence: u64,
@@ -59,6 +72,10 @@ pub const WalWriter = struct {
     truncation_epoch: u64,
     retain_floor: std.atomic.Value(u64),
     fsync_count: std.atomic.Value(u64),
+
+    durable_seq_pub: std.atomic.Value(u64),
+    flush_failed_pub: std.atomic.Value(bool),
+    notifier: ?DurabilityNotifier,
 
     pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool) !WalWriter {
         const path = try std.fs.path.join(allocator, &.{ dir, "wal.bin" });
@@ -128,7 +145,40 @@ pub const WalWriter = struct {
             .truncation_epoch = 0,
             .retain_floor = std.atomic.Value(u64).init(std.math.maxInt(u64)),
             .fsync_count = std.atomic.Value(u64).init(0),
+            .durable_seq_pub = std.atomic.Value(u64).init(@max(scan.last_sequence, base_sequence)),
+            .flush_failed_pub = std.atomic.Value(bool).init(false),
+            .notifier = null,
         };
+    }
+
+    /// Registers the async durability listener (see `DurabilityNotifier`). Call before
+    /// `startFlusher`; a single notifier serves all reactors, fanning out inside `notify`.
+    pub fn setNotifier(self: *WalWriter, n: DurabilityNotifier) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.notifier = n;
+    }
+
+    /// The published durable watermark — a lock-free mirror of `last_durable_seq` for parked
+    /// commits to poll on wakeup. Monotonic; may lag the locked value by one release.
+    pub fn durableSeqPublished(self: *const WalWriter) u64 {
+        return self.durable_seq_pub.load(.acquire);
+    }
+
+    /// Whether a flush has permanently failed — the lock-free mirror of `fsync_failed`. A parked
+    /// commit at or below the failure boundary must resolve as failed, never durable.
+    pub fn flushFailedPublished(self: *const WalWriter) bool {
+        return self.flush_failed_pub.load(.acquire);
+    }
+
+    fn publishDurable(self: *WalWriter) void {
+        self.durable_seq_pub.store(self.last_durable_seq, .release);
+        if (self.notifier) |n| n.fire();
+    }
+
+    fn publishFailure(self: *WalWriter) void {
+        self.flush_failed_pub.store(true, .release);
+        if (self.notifier) |n| n.fire();
     }
 
     pub fn startFlusher(self: *WalWriter) !void {
@@ -181,6 +231,7 @@ pub const WalWriter = struct {
         self.write_offset = 0;
         self.durable_offset = 0;
         self.truncation_epoch += 1;
+        self.publishDurable();
         self.flush_done_cond.broadcast();
     }
 
@@ -295,6 +346,7 @@ pub const WalWriter = struct {
 
         self.flushBack() catch |err| {
             self.fsync_failed = true;
+            self.publishFailure();
             self.flush_done_cond.broadcast();
             return err;
         };
@@ -306,6 +358,7 @@ pub const WalWriter = struct {
     fn markDurable(self: *WalWriter, flush_seq: u64) void {
         if (flush_seq > self.last_durable_seq) self.last_durable_seq = flush_seq;
         self.durable_offset = self.write_offset;
+        self.publishDurable();
     }
 
     fn flushBack(self: *WalWriter) !void {
@@ -392,6 +445,7 @@ pub const WalWriter = struct {
             } else |err| {
                 log.err("WAL flusher: flush failed: {}", .{err});
                 self.fsync_failed = true;
+                self.publishFailure();
             }
             self.back_in_flight = false;
             self.flush_done_cond.broadcast();
@@ -416,6 +470,7 @@ pub const WalWriter = struct {
                 self.markDurable(flush_seq);
             } else |_| {
                 self.fsync_failed = true;
+                self.publishFailure();
             }
             self.back_in_flight = false;
             self.flush_done_cond.broadcast();
@@ -579,6 +634,35 @@ test "sync flushes to disk" {
         const seq3 = try writer2.append(test_op, "data3");
         try std.testing.expectEqual(@as(u64, 3), seq3);
     }
+}
+
+test "durability notifier fires on flush and the published watermark tracks last_durable_seq" {
+    const tmp_dir = "/tmp/wal_test_notifier";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const Sink = struct {
+        fires: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        fn onNotify(ctx: *anyopaque) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            _ = s.fires.fetchAdd(1, .monotonic);
+        }
+    };
+    var sink = Sink{};
+
+    const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
+    defer deinitHeap(writer);
+    writer.setNotifier(.{ .ctx = &sink, .notify_fn = Sink.onNotify });
+
+    try std.testing.expectEqual(@as(u64, 0), writer.durableSeqPublished());
+    _ = try writer.append(test_op, "a");
+    _ = try writer.append(test_op, "b");
+    try writer.sync();
+
+    try std.testing.expectEqual(@as(u64, 2), writer.durableSeqPublished());
+    try std.testing.expect(sink.fires.load(.monotonic) >= 1);
+    try std.testing.expect(!writer.flushFailedPublished());
 }
 
 test "batch auto-flush on reaching batch_size" {

@@ -80,6 +80,8 @@ pub const forceSnapshot = snapshot.forceSnapshot;
 pub const commit = @import("commit.zig").commit;
 pub const commitSeq = @import("commit.zig").commitSeq;
 pub const CommitOptions = @import("commit.zig").CommitOptions;
+pub const CommitCompletion = @import("commit.zig").CommitCompletion;
+pub const DurabilityNotifier = @import("wal.zig").DurabilityNotifier;
 pub const ShardSet = @import("shard.zig").ShardSet;
 pub const replication = @import("replication.zig");
 

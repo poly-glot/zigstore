@@ -92,13 +92,38 @@ pub const CommitGate = struct {
     watermark: u64 = 0,
     closed: bool = false,
 
+    watermark_pub: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    closed_pub: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    notifier: ?wal.DurabilityNotifier = null,
+
+    /// Registers the async quorum listener — the doorbell rung when the watermark advances or
+    /// the gate closes, so a parked money-op commit is woken without blocking in `awaitQuorum`.
+    /// `notify` runs under the gate mutex and MUST NOT block.
+    pub fn setNotifier(self: *CommitGate, n: wal.DurabilityNotifier) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.notifier = n;
+    }
+
+    /// The published quorum watermark — a lock-free mirror for parked commits to poll on wakeup.
+    pub fn watermarkPublished(self: *const CommitGate) u64 {
+        return self.watermark_pub.load(.acquire);
+    }
+
+    /// Whether the gate is closed (replication stopped) — lock-free mirror for parked commits.
+    pub fn closedPublished(self: *const CommitGate) bool {
+        return self.closed_pub.load(.acquire);
+    }
+
     /// Raises the watermark monotonically and wakes every waiter.
     pub fn advance(self: *CommitGate, lsn: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (lsn > self.watermark) {
             self.watermark = lsn;
+            self.watermark_pub.store(lsn, .release);
             self.cond.broadcast();
+            if (self.notifier) |n| n.fire();
         }
     }
 
@@ -108,7 +133,9 @@ pub const CommitGate = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.closed = true;
+        self.closed_pub.store(true, .release);
         self.cond.broadcast();
+        if (self.notifier) |n| n.fire();
     }
 
     /// Re-arms a gate a previous hub closed; the watermark persists (LSNs are monotonic
@@ -117,6 +144,7 @@ pub const CommitGate = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.closed = false;
+        self.closed_pub.store(false, .release);
     }
 
     /// Blocks until the watermark reaches `lsn`; fails once the gate is closed.
