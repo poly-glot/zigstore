@@ -57,6 +57,10 @@ pub const Handler = struct {
     header_size: usize,
     on_shutdown: ?*const fn (ctx: *anyopaque) void = null,
     release_check: ?*const fn (ctx: *anyopaque, gate_durable_seq: u64, gate_quorum_seq: u64) ReleaseVerdict = null,
+    /// Max time a connection may stay parked before the reactor fails it (closes; the client
+    /// retries idempotently). Bounds a quorum-loss or wedged-flush wait the way the engine's
+    /// quorum deadline bounds the synchronous path. 0 (default) means no deadline.
+    parked_deadline_ms: i64 = 0,
 };
 
 pub const EpollServer = struct {
@@ -363,6 +367,7 @@ pub const EpollServer = struct {
             if (conn.response_len > 0) {
                 if (conn.gate_durable_seq != 0) {
                     conn.phase = .awaiting_durability;
+                    conn.parked_at_ms = std.time.milliTimestamp();
                     self.parked_count += 1;
                 } else {
                     conn.bytes_written = 0;
@@ -407,11 +412,18 @@ pub const EpollServer = struct {
     /// re-drain/re-park transitions stay well-defined.
     fn releaseParked(self: *Self) void {
         const check = self.handler.release_check orelse return;
+        const deadline = self.handler.parked_deadline_ms;
+        const now = if (deadline > 0) std.time.milliTimestamp() else 0;
         for (&self.connections) |*conn| {
             if (conn.phase != .awaiting_durability) continue;
             const fd = conn.fd;
             switch (check(self.ctx, conn.gate_durable_seq, conn.gate_quorum_seq)) {
-                .wait => {},
+                .wait => {
+                    if (deadline > 0 and now - conn.parked_at_ms > deadline) {
+                        log.warn("parked fd={d} exceeded {d}ms deadline (durable/quorum gate unmet) — failing", .{ fd, deadline });
+                        self.closeConnection(fd);
+                    }
+                },
                 .release => {
                     conn.gate_durable_seq = 0;
                     conn.gate_quorum_seq = 0;
@@ -421,7 +433,6 @@ pub const EpollServer = struct {
                     self.finishBinaryWrite(fd, conn);
                 },
                 .fail => {
-                    self.parked_count -= 1;
                     self.closeConnection(fd);
                 },
             }
@@ -485,9 +496,11 @@ pub const EpollServer = struct {
                 if (conn.gate_durable_seq != 0) {
                     if (conn.armed_for_write) {
                         self.armForRead(conn);
+                        if (conn.fd == -1) return;
                         conn.armed_for_write = false;
                     }
                     conn.phase = .awaiting_durability;
+                    conn.parked_at_ms = std.time.milliTimestamp();
                     self.parked_count += 1;
                     return;
                 }
@@ -621,4 +634,71 @@ test "Buffer pool size fits in u16" {
 test "Connection timeout constants are reasonable" {
     try std.testing.expect(CONNECTION_TIMEOUT_S > 0);
     try std.testing.expect(CONNECTION_TIMEOUT_S <= 300);
+}
+
+const ParkTestHandler = struct {
+    fn processFrames(_: *anyopaque, _: *connection.Connection) void {}
+    fn releaseFail(_: *anyopaque, _: u64, _: u64) ReleaseVerdict {
+        return .fail;
+    }
+    fn releaseGo(_: *anyopaque, _: u64, _: u64) ReleaseVerdict {
+        return .release;
+    }
+    fn releaseWait(_: *anyopaque, _: u64, _: u64) ReleaseVerdict {
+        return .wait;
+    }
+};
+
+fn parkTestServer(handler: Handler) !*EpollServer {
+    var ctx: u8 = 0;
+    return EpollServer.create(std.testing.allocator, &ctx, handler, .{ .port = 0, .thread_count = 2 });
+}
+
+fn injectParkedConn(server: *EpollServer, fd: posix.fd_t) void {
+    const free = server.findFreeSlot().?;
+    const bp = server.acquireBuffer().?;
+    free.conn.fd = fd;
+    free.conn.buf = bp;
+    free.conn.phase = .awaiting_durability;
+    free.conn.gate_durable_seq = 1;
+    free.conn.response_len = 0;
+    server.fd_to_slot.put(fd, free.idx) catch unreachable;
+    server.parked_count += 1;
+}
+
+test "releaseParked .fail un-parks exactly once — no parked_count double-decrement" {
+    const server = try parkTestServer(.{
+        .process_frames = ParkTestHandler.processFrames,
+        .header_size = 8,
+        .release_check = ParkTestHandler.releaseFail,
+    });
+    defer server.destroy();
+
+    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    injectParkedConn(server, fd);
+    try std.testing.expectEqual(@as(u32, 1), server.parked_count);
+
+    server.releaseParked();
+
+    try std.testing.expectEqual(@as(u32, 0), server.parked_count);
+    try std.testing.expect(server.findConnection(fd) == null);
+}
+
+test "releaseParked deadline-fail un-parks exactly once" {
+    const server = try parkTestServer(.{
+        .process_frames = ParkTestHandler.processFrames,
+        .header_size = 8,
+        .release_check = ParkTestHandler.releaseWait,
+        .parked_deadline_ms = 1,
+    });
+    defer server.destroy();
+
+    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    injectParkedConn(server, fd);
+    const slot = server.fd_to_slot.get(fd).?;
+    server.connections[slot].parked_at_ms = std.time.milliTimestamp() - 1000;
+
+    server.releaseParked();
+
+    try std.testing.expectEqual(@as(u32, 0), server.parked_count);
 }

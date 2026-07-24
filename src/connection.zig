@@ -31,6 +31,7 @@ pub const Connection = struct {
     armed_for_write: bool = false,
     gate_durable_seq: u64 = 0,
     gate_quorum_seq: u64 = 0,
+    parked_at_ms: i64 = 0,
 
     pub fn reset(self: *Connection) void {
         self.fd = -1;
@@ -43,6 +44,7 @@ pub const Connection = struct {
         self.armed_for_write = false;
         self.gate_durable_seq = 0;
         self.gate_quorum_seq = 0;
+        self.parked_at_ms = 0;
     }
 
     pub fn isActive(self: *const Connection) bool {

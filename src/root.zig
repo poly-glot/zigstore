@@ -96,6 +96,8 @@ pub const MEMTABLE_SHARDS = @import("memtable.zig").NUM_SHARDS;
 pub const ServerConfig = @import("server_config.zig").ServerConfig;
 pub const EpollServer = @import("epoll.zig").EpollServer;
 pub const Handler = @import("epoll.zig").Handler;
+pub const ReleaseVerdict = @import("epoll.zig").ReleaseVerdict;
+pub const epoll = @import("epoll.zig");
 pub const run = @import("run.zig").run;
 pub const RunHooks = @import("run.zig").RunHooks;
 
