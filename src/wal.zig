@@ -45,6 +45,22 @@ pub const DurabilityNotifier = struct {
     }
 };
 
+/// One in-flight flush unit in the depth-N pipeline (Stage 2). Its `scratch` holds a batch's
+/// 4KB-aligned bytes pwritten to `[offset, offset+len)` — a range reserved in submission==sequence
+/// order under the lock, so every in-flight slot's range is disjoint and concurrent O_DIRECT pwrites
+/// cannot tear one another. `seq` is the batch's max WAL sequence; `epoch` is the truncation epoch at
+/// dispatch (a straggler fsync from a prior epoch is discarded). `write_done` gates the contiguous
+/// write-complete fold that advances the certified durable prefix.
+const FlushSlot = struct {
+    scratch: []align(BLOCK_SIZE) u8 = &.{},
+    len: usize = 0,
+    seq: u64 = 0,
+    offset: u64 = 0,
+    epoch: u64 = 0,
+    write_done: bool = false,
+    in_use: bool = false,
+};
+
 pub const WalWriter = struct {
     file: std.fs.File,
     sequence: u64,
@@ -86,9 +102,35 @@ pub const WalWriter = struct {
     flushes_in_flight: std.atomic.Value(u32),
     max_flushes_in_flight: std.atomic.Value(u32),
 
+    // Stage 2 depth-N pipeline (used only when flush_depth > 1; depth==1 stays on the legacy
+    // front/back/back_in_flight/direct_buf path above, byte-identical). Slots form a ring of
+    // slot_count = flush_depth + 2 units. submit_index counts dispatched flushes (slot =
+    // submit_index % slot_count); fold_index counts write-complete-folded flushes; their difference
+    // is the in-flight count. write_complete_{seq,offset} is the contiguous durable-eligible prefix.
+    // Each worker owns its own fd (worker_fds) — never dup'd, so one worker's failed-fdatasync errseq
+    // can't be reaped by another. backstop_ns paces partial-batch flushes.
+    slots: []FlushSlot,
+    slot_count: u64,
+    submit_index: u64,
+    fold_index: u64,
+    write_complete_seq: u64,
+    write_complete_offset: u64,
+    flushers: []std.Thread,
+    worker_fds: []std.fs.File,
+    wal_path: []const u8,
+    // Set by a depth>1 truncateAfterCheckpoint to quiesce appends across its drain+reset, so no
+    // entry is appended (and independently acked via awaitDurable) only to be discarded by
+    // setEndPos(0) — restoring the atomicity the depth-1 lock-held path has. Never set at depth-1.
+    pause_appends: bool,
+    // Test-only fault injection: when set, the next pool fdatasync is treated as failed, exercising
+    // the failure-freeze + deadlock-free teardown paths. Always false in production.
+    test_fail_fsync: std.atomic.Value(bool),
+
     pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool, flush_depth: u32) !WalWriter {
         const path = try std.fs.path.join(allocator, &.{ dir, "wal.bin" });
         defer allocator.free(path);
+        const wal_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(wal_path);
 
         const scan_file = try openOrCreateFile(path);
         const scan = scanWal(scan_file, allocator) catch |err| {
@@ -154,13 +196,27 @@ pub const WalWriter = struct {
             .truncation_epoch = 0,
             .retain_floor = std.atomic.Value(u64).init(std.math.maxInt(u64)),
             .fsync_count = std.atomic.Value(u64).init(0),
-            .flush_depth = if (!want_direct_io or flush_depth == 0) 1 else flush_depth,
+            // Clamp on the RESOLVED direct_io (openWithDirect may have fallen back to buffered), not
+            // the want_direct_io param — else a buffered-fallback filesystem takes the O_DIRECT-only
+            // pool path and fails WAL open instead of running the depth-1 legacy flusher (the kill-switch).
+            .flush_depth = if (!direct_io or flush_depth == 0) 1 else flush_depth,
             .appends_total = std.atomic.Value(u64).init(0),
             .flushes_in_flight = std.atomic.Value(u32).init(0),
             .max_flushes_in_flight = std.atomic.Value(u32).init(0),
             .durable_seq_pub = std.atomic.Value(u64).init(@max(scan.last_sequence, base_sequence)),
             .flush_failed_pub = std.atomic.Value(bool).init(false),
             .notifier = null,
+            .slots = &.{},
+            .slot_count = 0,
+            .submit_index = 0,
+            .fold_index = 0,
+            .write_complete_seq = @max(scan.last_sequence, base_sequence),
+            .write_complete_offset = initial_offset,
+            .flushers = &.{},
+            .worker_fds = &.{},
+            .wal_path = wal_path,
+            .pause_appends = false,
+            .test_fail_fsync = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -204,27 +260,232 @@ pub const WalWriter = struct {
     }
 
     pub fn startFlusher(self: *WalWriter) !void {
-        self.flusher_thread = std.Thread.spawn(.{}, flusherLoop, .{self}) catch |err| {
-            log.err("Failed to spawn WAL flusher thread: {}", .{err});
-            return err;
-        };
+        if (self.flush_depth <= 1) {
+            self.flusher_thread = std.Thread.spawn(.{}, flusherLoop, .{self}) catch |err| {
+                log.err("Failed to spawn WAL flusher thread: {}", .{err});
+                return err;
+            };
+            return;
+        }
+        try self.startFlusherPool();
+    }
+
+    // ---- Stage 2 depth-N pipeline ----
+
+    fn startFlusherPool(self: *WalWriter) !void {
+        self.slot_count = @as(u64, self.flush_depth) + 2;
+        self.slots = try self.allocator.alloc(FlushSlot, self.slot_count);
+        errdefer {
+            self.allocator.free(self.slots);
+            self.slots = &.{};
+        }
+        for (self.slots) |*s| s.* = .{};
+
+        self.worker_fds = try self.allocator.alloc(std.fs.File, self.flush_depth);
+        errdefer {
+            self.allocator.free(self.worker_fds);
+            self.worker_fds = &.{};
+        }
+        // The pool only runs with O_DIRECT (depth is force-clamped to 1 in buffered mode), so every
+        // worker fd is an independent O_DIRECT handle on the same file.
+        var opened: usize = 0;
+        errdefer for (self.worker_fds[0..opened]) |f| f.close();
+        while (opened < self.flush_depth) : (opened += 1) {
+            self.worker_fds[opened] = try openWithDirectRequired(self.wal_path);
+        }
+
+        self.flushers = try self.allocator.alloc(std.Thread, self.flush_depth);
+        errdefer {
+            self.allocator.free(self.flushers);
+            self.flushers = &.{};
+        }
+        var spawned: usize = 0;
+        errdefer {
+            self.shutdown.store(true, .release);
+            self.flush_cond.broadcast();
+            for (self.flushers[0..spawned]) |t| t.join();
+        }
+        while (spawned < self.flush_depth) : (spawned += 1) {
+            self.flushers[spawned] = try std.Thread.spawn(.{}, flusherPoolLoop, .{ self, spawned });
+        }
+    }
+
+    fn inFlightLocked(self: *WalWriter) u64 {
+        return self.submit_index - self.fold_index;
+    }
+
+    fn foldWriteComplete(self: *WalWriter) void {
+        while (self.fold_index < self.submit_index) {
+            const slot = &self.slots[self.fold_index % self.slot_count];
+            if (!slot.write_done) break;
+            self.write_complete_seq = slot.seq;
+            self.write_complete_offset = slot.offset + slot.len;
+            slot.in_use = false;
+            self.fold_index += 1;
+        }
+    }
+
+    fn advanceDurableLocked(self: *WalWriter, seq: u64, off: u64) void {
+        if (self.fsync_failed) return;
+        if (seq > self.last_durable_seq) {
+            self.last_durable_seq = seq;
+            self.durable_offset = off;
+            self.publishDurable();
+        }
+    }
+
+    fn latchFailure(self: *WalWriter) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.fsync_failed = true;
+        self.publishFailure();
+        self.flush_done_cond.broadcast();
+    }
+
+    fn flusherPoolLoop(self: *WalWriter, worker: usize) void {
+        const wfd = self.worker_fds[worker];
+        while (true) {
+            self.lock.lock();
+
+            while (true) {
+                if (self.fsync_failed) {
+                    // Exit on shutdown ALONE, not gated on inFlightLocked()==0: a failed pwrite
+                    // abandons its slot with write_done=false, so fold_index (and thus in-flight)
+                    // can never drain — waiting for it would deadlock deinit's join(). Safe because
+                    // durability is frozen after a latch (advanceDurableLocked early-returns), so the
+                    // abandoned slot holds no acked-yet-unflushed data.
+                    if (self.shutdown.load(.acquire)) {
+                        self.lock.unlock();
+                        return;
+                    }
+                    self.flush_cond.timedWait(&self.lock, 2 * std.time.ns_per_ms) catch {};
+                    continue;
+                }
+                if (self.front.items.len == 0) {
+                    if (self.shutdown.load(.acquire) and self.inFlightLocked() == 0) {
+                        self.lock.unlock();
+                        return;
+                    }
+                    self.flush_cond.timedWait(&self.lock, 2 * std.time.ns_per_ms) catch {};
+                    continue;
+                }
+                if (self.inFlightLocked() >= self.flush_depth) {
+                    self.flush_done_cond.timedWait(&self.lock, 2 * std.time.ns_per_ms) catch {};
+                    continue;
+                }
+                if (self.entry_count < self.batch_size and !self.shutdown.load(.acquire)) {
+                    // Small batch: give it one 2ms backstop window to accumulate, then flush anyway.
+                    self.flush_cond.timedWait(&self.lock, 2 * std.time.ns_per_ms) catch {};
+                    if (self.front.items.len == 0 or self.inFlightLocked() >= self.flush_depth) continue;
+                }
+                break;
+            }
+
+            const idx = self.submit_index;
+            const slot = &self.slots[idx % self.slot_count];
+            const n = self.front.items.len;
+            const padded = paddedLength(n);
+            if (padded > slot.scratch.len) {
+                var new_cap: usize = if (slot.scratch.len == 0) BLOCK_SIZE else slot.scratch.len;
+                while (new_cap < padded) new_cap *= 2;
+                const new_buf = self.allocator.alignedAlloc(u8, .fromByteUnits(BLOCK_SIZE), new_cap) catch {
+                    self.lock.unlock();
+                    self.latchFailure();
+                    continue;
+                };
+                if (slot.scratch.len > 0) self.allocator.free(slot.scratch);
+                slot.scratch = new_buf;
+            }
+            @memcpy(slot.scratch[0..n], self.front.items);
+            @memset(slot.scratch[n..padded], PAD_BYTE);
+            slot.len = padded;
+            slot.seq = self.pending_max_seq;
+            slot.offset = self.write_offset;
+            slot.epoch = self.truncation_epoch;
+            slot.write_done = false;
+            slot.in_use = true;
+            self.write_offset += padded;
+            self.submit_index += 1;
+            self.front.clearRetainingCapacity();
+            self.entry_count = 0;
+            self.pending_max_seq = 0;
+            self.lock.unlock();
+
+            wfd.pwriteAll(slot.scratch[0..padded], slot.offset) catch |err| {
+                log.err("WAL pool pwrite failed: {}", .{err});
+                self.latchFailure();
+                continue;
+            };
+
+            self.lock.lock();
+            slot.write_done = true;
+            self.foldWriteComplete();
+            const snap_seq = self.write_complete_seq;
+            const snap_off = self.write_complete_offset;
+            const snap_epoch = self.truncation_epoch;
+            self.flush_done_cond.broadcast();
+            self.lock.unlock();
+
+            const in_flight = self.flushes_in_flight.fetchAdd(1, .monotonic) + 1;
+            var hw = self.max_flushes_in_flight.load(.monotonic);
+            while (in_flight > hw) hw = self.max_flushes_in_flight.cmpxchgWeak(hw, in_flight, .monotonic, .monotonic) orelse break;
+            const fsync_err = if (self.test_fail_fsync.load(.monotonic)) error.InjectedFsyncFailure else posix.fdatasync(wfd.handle);
+            _ = self.flushes_in_flight.fetchSub(1, .monotonic);
+            _ = self.fsync_count.fetchAdd(1, .monotonic);
+            fsync_err catch |err| {
+                if (err != error.InjectedFsyncFailure) log.err("WAL pool fdatasync failed: {}", .{err});
+                self.latchFailure();
+                continue;
+            };
+
+            self.lock.lock();
+            if (self.truncation_epoch == snap_epoch) self.advanceDurableLocked(snap_seq, snap_off);
+            self.flush_done_cond.broadcast();
+            self.lock.unlock();
+        }
+    }
+
+    /// Drain the pipeline to durability: dispatch all of `front`, wait until every in-flight flush is
+    /// write-complete AND `last_durable_seq` reaches the current tail. Caller holds `lock`. Used by
+    /// sync/truncate/deinit at depth>1 (the depth-N analogue of `swapAndFlush`).
+    fn drainPoolLocked(self: *WalWriter) !void {
+        while (true) {
+            if (self.fsync_failed) return error.WalFlushFailed;
+            // front empty + nothing in flight ⇒ every append (incl. any that interleaved during a
+            // wait) is write-complete; then wait for last_durable to catch its fsyncs up to sequence.
+            if (self.front.items.len == 0 and self.inFlightLocked() == 0 and self.last_durable_seq >= self.sequence) return;
+            self.flush_cond.broadcast();
+            self.flush_done_cond.timedWait(&self.lock, 2 * std.time.ns_per_ms) catch {};
+        }
     }
 
     pub fn deinit(self: *WalWriter) void {
         self.shutdown.store(true, .release);
-        self.flush_cond.signal();
 
-        if (self.flusher_thread) |t| t.join();
-
-        self.lock.lock();
-        self.swapAndFlush() catch |err| {
-            log.err("WAL final flush failed: {}", .{err});
-        };
-        self.lock.unlock();
+        if (self.flush_depth > 1) {
+            self.flush_cond.broadcast();
+            for (self.flushers) |t| t.join();
+            // Workers drained front + all in-flight before exiting (unless a flush failed). Any
+            // residual (only possible after a latched failure) is intentionally not re-flushed.
+            for (self.slots) |s| if (s.scratch.len > 0) self.allocator.free(s.scratch);
+            for (self.worker_fds) |f| f.close();
+            self.allocator.free(self.slots);
+            self.allocator.free(self.worker_fds);
+            self.allocator.free(self.flushers);
+        } else {
+            self.flush_cond.signal();
+            if (self.flusher_thread) |t| t.join();
+            self.lock.lock();
+            self.swapAndFlush() catch |err| {
+                log.err("WAL final flush failed: {}", .{err});
+            };
+            self.lock.unlock();
+        }
 
         self.front.deinit(self.allocator);
         self.back.deinit(self.allocator);
         self.allocator.free(self.direct_buf);
+        self.allocator.free(self.wal_path);
         self.file.close();
     }
 
@@ -234,7 +495,14 @@ pub const WalWriter = struct {
 
         if (self.retain_floor.load(.acquire) < self.sequence) return error.WalRetainedByReplica;
 
-        try self.swapAndFlush();
+        if (self.flush_depth > 1) {
+            self.pause_appends = true;
+            defer {
+                self.pause_appends = false;
+                self.flush_done_cond.broadcast();
+            }
+            try self.drainPoolLocked();
+        } else try self.swapAndFlush();
 
         try self.file.setEndPos(0);
         try self.file.seekTo(0);
@@ -253,6 +521,10 @@ pub const WalWriter = struct {
         self.write_offset = 0;
         self.durable_offset = 0;
         self.truncation_epoch += 1;
+        // Reset the pool's contiguous-prefix cursors to the post-truncate origin; a straggler fsync
+        // from the prior epoch is discarded by the epoch guard in flusherPoolLoop.
+        self.write_complete_seq = self.sequence;
+        self.write_complete_offset = 0;
         self.publishDurable();
         self.flush_done_cond.broadcast();
     }
@@ -264,6 +536,10 @@ pub const WalWriter = struct {
 
         self.lock.lock();
         defer self.lock.unlock();
+
+        // Quiesce during a depth-N truncate drain so this entry can't be appended-then-discarded
+        // (never true at depth-1). Recheck across spurious flush_done_cond wakeups.
+        while (self.pause_appends) self.flush_done_cond.wait(&self.lock);
 
         self.sequence += 1;
         const seq = self.sequence;
@@ -306,6 +582,7 @@ pub const WalWriter = struct {
     pub fn sync(self: *WalWriter) !void {
         self.lock.lock();
         defer self.lock.unlock();
+        if (self.flush_depth > 1) return self.drainPoolLocked();
         try self.swapAndFlush();
     }
 
@@ -561,6 +838,17 @@ pub const WalWriter = struct {
         };
     }
 
+    /// Opens an ADDITIONAL O_DIRECT fd on an existing WAL file for a pool worker. Unlike
+    /// `openWithDirect` it never falls back to buffered (the pool only runs when the main fd already
+    /// resolved O_DIRECT) and never truncates. Each worker fd is independent — NOT dup'd — so a failed
+    /// `fdatasync`'s `errseq` cursor is not shared/reaped across workers.
+    fn openWithDirectRequired(path: []const u8) !std.fs.File {
+        const O = posix.O;
+        const flags: O = .{ .ACCMODE = .RDWR, .CLOEXEC = true, .DIRECT = true };
+        const fd = try posix.open(path, flags, 0o644);
+        return std.fs.File{ .handle = fd };
+    }
+
     const MAX_RECOVERY_DATA_LEN: u32 = 16 * 1024 * 1024;
 
     const ScanResult = struct { last_sequence: u64, valid_end: u64 };
@@ -633,10 +921,149 @@ fn initHeap(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base
     return w;
 }
 
+fn initHeapDepth(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, flush_depth: u32) !*WalWriter {
+    const w = try allocator.create(WalWriter);
+    w.* = try WalWriter.init(allocator, dir, batch_size, base_sequence, true, flush_depth);
+    try w.startFlusher();
+    return w;
+}
+
 fn deinitHeap(w: *WalWriter) void {
     const allocator = w.allocator;
     w.deinit();
     allocator.destroy(w);
+}
+
+test "pool: depth-N durability survives reopen (no lost/holed acked entries)" {
+    const tmp_dir = "/tmp/wal_test_pool_durable";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    {
+        const w = initHeapDepth(std.testing.allocator, tmp_dir, 8, 0, 4) catch |e| {
+            // O_DIRECT unavailable on the test filesystem → depth clamps and the pool never runs.
+            if (e == error.WalWorkerFdOpen) return error.SkipZigTest;
+            return e;
+        };
+        defer deinitHeap(w);
+        if (w.flushDepth() == 1) return error.SkipZigTest; // buffered fallback: not a pool run.
+        var i: usize = 0;
+        while (i < 500) : (i += 1) {
+            var buf: [24]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "entry-{d}", .{i});
+            _ = try w.append(test_op, s);
+        }
+        try w.sync();
+        try std.testing.expectEqual(@as(u64, 500), w.last_durable_seq);
+        try std.testing.expect(w.appendsTotal() == 500);
+    }
+
+    {
+        const w2 = try initHeap(std.testing.allocator, tmp_dir, 8, 0);
+        defer deinitHeap(w2);
+        try std.testing.expectEqual(@as(u64, 500), w2.getSequence());
+        const next = try w2.append(test_op, "post");
+        try std.testing.expectEqual(@as(u64, 501), next);
+    }
+}
+
+test "pool: concurrent appends at depth 16 lose nothing and actually pipeline" {
+    const tmp_dir = "/tmp/wal_test_pool_concurrent";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const w = initHeapDepth(std.testing.allocator, tmp_dir, 32, 0, 16) catch |e| {
+        if (e == error.WalWorkerFdOpen) return error.SkipZigTest;
+        return e;
+    };
+    defer deinitHeap(w);
+    if (w.flushDepth() == 1) return error.SkipZigTest;
+
+    const Writer = struct {
+        wal: *WalWriter,
+        n: usize,
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.n) : (i += 1) _ = self.wal.append(test_op, "x") catch return;
+        }
+    };
+    var ctxs: [8]Writer = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&ctxs, 0..) |*c, k| {
+        c.* = .{ .wal = w, .n = 1000 };
+        threads[k] = try std.Thread.spawn(.{}, Writer.run, .{c});
+    }
+    for (threads) |t| t.join();
+
+    try w.sync();
+    try std.testing.expectEqual(@as(u64, 8000), w.last_durable_seq);
+    try std.testing.expectEqual(@as(u64, 8000), w.appendsTotal());
+    // The whole point: more than one fdatasync was concurrently in flight.
+    try std.testing.expect(w.maxFlushesInFlight() > 1);
+
+    // Reopen and confirm the durable count is intact and contiguous.
+    const reopened = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
+    defer deinitHeap(reopened);
+    try std.testing.expectEqual(@as(u64, 8000), reopened.getSequence());
+}
+
+test "pool: a failed fsync freezes durability and deinit does not deadlock" {
+    const tmp_dir = "/tmp/wal_test_pool_fail";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const w = initHeapDepth(std.testing.allocator, tmp_dir, 8, 0, 4) catch |e| {
+        if (e == error.WalWorkerFdOpen) return error.SkipZigTest;
+        return e;
+    };
+    defer deinitHeap(w); // must not hang despite the latched failure + abandoned in-flight slot
+    if (w.flushDepth() == 1) return error.SkipZigTest;
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) _ = try w.append(test_op, "a");
+    try w.sync();
+    const durable_before = w.last_durable_seq;
+    try std.testing.expect(durable_before >= 50);
+
+    // Inject: every subsequent fdatasync fails.
+    w.test_fail_fsync.store(true, .monotonic);
+    i = 0;
+    while (i < 50) : (i += 1) _ = w.append(test_op, "b") catch break;
+
+    // awaitDurable for a post-failure seq must surface the failure, never a false ACK.
+    try std.testing.expectError(error.WalFlushFailed, w.awaitDurable(200));
+    // The durable watermark is frozen — never advances past the pre-failure certified prefix.
+    try std.testing.expect(w.flushFailedPublished());
+    try std.testing.expectEqual(durable_before, w.last_durable_seq);
+    // deinitHeap (defer) now joins all workers — the assertion is that it returns at all.
+}
+
+test "pool: truncateAfterCheckpoint drains, resets, and keeps appending" {
+    const tmp_dir = "/tmp/wal_test_pool_truncate";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const w = initHeapDepth(std.testing.allocator, tmp_dir, 8, 0, 4) catch |e| {
+        if (e == error.WalWorkerFdOpen) return error.SkipZigTest;
+        return e;
+    };
+    defer deinitHeap(w);
+    if (w.flushDepth() == 1) return error.SkipZigTest;
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) _ = try w.append(test_op, "a");
+    try w.sync();
+    try w.truncateAfterCheckpoint();
+    try std.testing.expectEqual(@as(u64, 100), w.last_durable_seq);
+    try std.testing.expectEqual(@as(u64, 0), w.durable_offset);
+
+    _ = try w.append(test_op, "b");
+    try w.sync();
+    try std.testing.expectEqual(@as(u64, 101), w.last_durable_seq);
 }
 
 test "append entries and verify sequence" {
