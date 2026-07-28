@@ -351,8 +351,7 @@ pub const EpollServer = struct {
 
     fn handleEvent(self: *Self, fd: posix.fd_t, events: u32) void {
         const conn = self.findConnection(fd) orelse {
-            posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
-            posix.close(fd);
+            if (self.fd_to_slot.contains(fd)) self.closeConnection(fd);
             return;
         };
 
@@ -701,4 +700,53 @@ test "releaseParked deadline-fail un-parks exactly once" {
     server.releaseParked();
 
     try std.testing.expectEqual(@as(u32, 0), server.parked_count);
+}
+
+fn fdIsOpen(fd: posix.fd_t) bool {
+    return posix.errno(linux.fcntl(fd, posix.F.GETFD, 0)) == .SUCCESS;
+}
+
+fn plainTestServer() !*EpollServer {
+    return parkTestServer(.{
+        .process_frames = ParkTestHandler.processFrames,
+        .header_size = 8,
+    });
+}
+
+test "handleEvent leaves an fd the reactor does not own untouched" {
+    const server = try plainTestServer();
+    defer server.destroy();
+
+    const unowned = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(unowned);
+
+    server.handleEvent(unowned, linux.EPOLL.IN);
+
+    try std.testing.expect(fdIsOpen(unowned));
+    try std.testing.expect(!server.fd_to_slot.contains(unowned));
+}
+
+test "handleEvent on a stale event for an already-closed fd does not abort the reactor" {
+    const server = try plainTestServer();
+    defer server.destroy();
+
+    const recycled = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    posix.close(recycled);
+
+    server.handleEvent(recycled, linux.EPOLL.IN);
+}
+
+test "handleEvent still reaps an owned slot whose connection went inactive" {
+    const server = try plainTestServer();
+    defer server.destroy();
+
+    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const free = server.findFreeSlot().?;
+    free.conn.phase = .empty;
+    try server.fd_to_slot.put(fd, free.idx);
+
+    server.handleEvent(fd, linux.EPOLL.IN);
+
+    try std.testing.expect(!server.fd_to_slot.contains(fd));
+    try std.testing.expect(!fdIsOpen(fd));
 }
