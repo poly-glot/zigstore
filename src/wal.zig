@@ -77,12 +77,17 @@ pub const WalWriter = struct {
     flush_failed_pub: std.atomic.Value(bool),
     notifier: ?DurabilityNotifier,
 
+    appends_paused: bool,
+    append_cond: std.Thread.Condition,
+
     pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool) !WalWriter {
         const path = try std.fs.path.join(allocator, &.{ dir, "wal.bin" });
         defer allocator.free(path);
 
+        const effective_batch_size: u32 = if (batch_size == 0) 32 else batch_size;
+
         const scan_file = try openOrCreateFile(path);
-        const scan = scanWal(scan_file, allocator) catch |err| {
+        const scan = scanWal(scan_file, allocator, effective_batch_size) catch |err| {
             scan_file.close();
             return err;
         };
@@ -127,7 +132,7 @@ pub const WalWriter = struct {
             .front = .{},
             .back = .{},
             .entry_count = 0,
-            .batch_size = if (batch_size == 0) 32 else batch_size,
+            .batch_size = effective_batch_size,
             .lock = .{},
             .flush_cond = .{},
             .back_in_flight = false,
@@ -148,7 +153,26 @@ pub const WalWriter = struct {
             .durable_seq_pub = std.atomic.Value(u64).init(@max(scan.last_sequence, base_sequence)),
             .flush_failed_pub = std.atomic.Value(bool).init(false),
             .notifier = null,
+            .appends_paused = false,
+            .append_cond = .{},
         };
+    }
+
+    /// Block every `append` until `resumeAppends`. The store's checkpoint pauses appends so
+    /// that, once every already-appended entry has applied, no WAL entry can exist that the
+    /// checkpoint does not contain. Appends in flight finish; the flusher keeps running.
+    pub fn pauseAppends(self: *WalWriter) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.appends_paused = true;
+    }
+
+    /// Lift `pauseAppends` and wake every blocked `append`.
+    pub fn resumeAppends(self: *WalWriter) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.appends_paused = false;
+        self.append_cond.broadcast();
     }
 
     /// Registers the async durability listener (see `DurabilityNotifier`). Call before
@@ -252,6 +276,9 @@ pub const WalWriter = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
+        while (self.appends_paused) self.append_cond.wait(&self.lock);
+        try self.front.ensureUnusedCapacity(self.allocator, HEADER_SIZE + data.len);
+
         self.sequence += 1;
         const seq = self.sequence;
 
@@ -265,8 +292,8 @@ pub const WalWriter = struct {
         };
 
         const header_bytes: *const [HEADER_SIZE]u8 = @ptrCast(&header);
-        try self.front.appendSlice(self.allocator, header_bytes);
-        try self.front.appendSlice(self.allocator, data);
+        self.front.appendSliceAssumeCapacity(header_bytes);
+        self.front.appendSliceAssumeCapacity(data);
 
         self.entry_count += 1;
         self.pending_max_seq = seq;
@@ -526,64 +553,99 @@ pub const WalWriter = struct {
 
     const ScanResult = struct { last_sequence: u64, valid_end: u64 };
 
-    fn scanWal(file: std.fs.File, allocator: std.mem.Allocator) !ScanResult {
+    const RecordVerdict = union(enum) {
+        valid: struct { sequence: u64, end: u64 },
+        padding,
+        preallocated,
+        invalid,
+    };
+
+    /// Whether a record header can belong to a well-formed WAL that already holds `last_seq`:
+    /// strictly increasing sequence, zero pads, and a payload within the recovery bound. Shared
+    /// by the open-time scan and `wal_replay.WalReader`.
+    pub fn headerSane(header: WalEntryHeader, last_seq: u64) bool {
+        return header.sequence > last_seq and
+            header.data_len <= MAX_RECOVERY_DATA_LEN and
+            std.mem.allEqual(u8, &header._pad, 0) and
+            std.mem.allEqual(u8, &header._pad2, 0);
+    }
+
+    fn scanWal(file: std.fs.File, allocator: std.mem.Allocator, batch_size: u32) !ScanResult {
         const file_size = try file.getEndPos();
         if (file_size == 0) return .{ .last_sequence = 0, .valid_end = 0 };
-
-        try file.seekTo(0);
 
         var data_buf: std.ArrayList(u8) = .{};
         defer data_buf.deinit(allocator);
 
         var last_seq: u64 = 0;
         var pos: u64 = 0;
-        var saw_padding: bool = false;
 
         while (pos + HEADER_SIZE <= file_size) {
-            var header_buf: [HEADER_SIZE]u8 = undefined;
-            const hn = try file.readAll(&header_buf);
-            if (hn < HEADER_SIZE) break;
-
-            const header = std.mem.bytesToValue(WalEntryHeader, &header_buf);
-            if (header.sequence == 0) {
-                saw_padding = true;
-                break;
-            }
-            const data_len: u32 = header.data_len;
-
-            if (data_len > MAX_RECOVERY_DATA_LEN) {
-                const next_block = std.mem.alignForward(u64, pos + 1, BLOCK_SIZE);
-                if (next_block >= file_size) {
-                    saw_padding = true;
+            switch (try readRecord(file, pos, file_size, last_seq, &data_buf, allocator)) {
+                .valid => |record| {
+                    last_seq = record.sequence;
+                    pos = record.end;
+                },
+                .preallocated => break,
+                .padding => {
+                    const next_block = std.mem.alignForward(u64, pos + 1, BLOCK_SIZE);
+                    if (next_block >= file_size) break;
+                    pos = next_block;
+                },
+                .invalid => {
+                    const trailing = try countValidRecordsAfter(file, pos, file_size, last_seq, &data_buf, allocator, batch_size);
+                    if (trailing > batch_size) {
+                        log.warn("WAL: corrupt record at offset {d} is followed by {d} valid records (more than one batch of {d}); refusing to start", .{ pos, trailing, batch_size });
+                        return error.WalCorrupt;
+                    }
+                    log.warn("WAL: truncating torn tail at offset {d}: {d} bytes, {d} unacknowledged records discarded", .{ pos, file_size - pos, trailing });
                     break;
-                }
-                pos = next_block;
-                try file.seekTo(pos);
-                continue;
-            }
-            if (pos + HEADER_SIZE + data_len > file_size) break;
-
-            try data_buf.resize(allocator, data_len);
-            const dn = try file.readAll(data_buf.items);
-            if (dn < data_len) break;
-
-            const computed = std.hash.crc.Crc32.hash(data_buf.items);
-            if (computed != header.checksum) break;
-
-            last_seq = header.sequence;
-            pos += HEADER_SIZE + data_len;
-            try file.seekTo(pos);
-        }
-
-        if (pos < file_size) {
-            if (saw_padding) {
-                log.debug("WAL: stripped {d} bytes of preallocated/padded tail at offset {d}", .{ file_size - pos, pos });
-            } else {
-                log.warn("WAL: truncating {d} bytes of torn/corrupt tail at offset {d}", .{ file_size - pos, pos });
+                },
             }
         }
 
         return .{ .last_sequence = last_seq, .valid_end = pos };
+    }
+
+    fn readRecord(file: std.fs.File, pos: u64, file_size: u64, last_seq: u64, data_buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !RecordVerdict {
+        var header_buf: [HEADER_SIZE]u8 = undefined;
+        const hn = try file.preadAll(&header_buf, pos);
+        if (hn < HEADER_SIZE) return .invalid;
+        if (std.mem.allEqual(u8, &header_buf, 0)) return .preallocated;
+        if (std.mem.allEqual(u8, &header_buf, PAD_BYTE)) return .padding;
+
+        const header = std.mem.bytesToValue(WalEntryHeader, &header_buf);
+        if (!headerSane(header, last_seq)) return .invalid;
+
+        const end = pos + HEADER_SIZE + header.data_len;
+        if (end > file_size) return .invalid;
+
+        try data_buf.resize(allocator, header.data_len);
+        const dn = try file.preadAll(data_buf.items, pos + HEADER_SIZE);
+        if (dn < header.data_len) return .invalid;
+        if (std.hash.crc.Crc32.hash(data_buf.items) != header.checksum) return .invalid;
+
+        return .{ .valid = .{ .sequence = header.sequence, .end = end } };
+    }
+
+    fn countValidRecordsAfter(file: std.fs.File, bad_pos: u64, file_size: u64, last_seq: u64, data_buf: *std.ArrayList(u8), allocator: std.mem.Allocator, limit: u32) !u32 {
+        var count: u32 = 0;
+        var seq = last_seq;
+        var pos = std.mem.alignForward(u64, bad_pos + 1, BLOCK_SIZE);
+
+        while (pos + HEADER_SIZE <= file_size and count <= limit) {
+            switch (try readRecord(file, pos, file_size, seq, data_buf, allocator)) {
+                .valid => |record| {
+                    count += 1;
+                    seq = record.sequence;
+                    pos = record.end;
+                },
+                .preallocated => break,
+                .padding, .invalid => pos = std.mem.alignForward(u64, pos + 1, BLOCK_SIZE),
+            }
+        }
+
+        return count;
     }
 };
 
@@ -781,7 +843,7 @@ test "truncateAfterCheckpoint zeroes the WAL and preserves the sequence" {
         defer std.testing.allocator.free(path);
         const scan_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
         defer scan_file.close();
-        const recovered = try WalWriter.scanWal(scan_file, std.testing.allocator);
+        const recovered = try WalWriter.scanWal(scan_file, std.testing.allocator, 32);
         try std.testing.expectEqual(@as(u64, 0), recovered.last_sequence);
 
         const seq = try writer.append(test_op, "post-truncate");
@@ -1049,4 +1111,101 @@ test "init propagates a scan failure instead of truncating the WAL" {
         defer deinitHeap(writer);
         try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
     }
+}
+
+test "append blocks while appends are paused and completes after resume" {
+    const tmp_dir = "/tmp/wal_test_pause_appends";
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    try std.fs.makeDirAbsolute(tmp_dir);
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
+    defer deinitHeap(writer);
+
+    const Appender = struct {
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        seq: u64 = 0,
+
+        fn run(self: *@This(), w: *WalWriter) void {
+            self.seq = w.append(test_op, "paused") catch 0;
+            self.done.store(true, .release);
+        }
+    };
+
+    writer.pauseAppends();
+    var appender = Appender{};
+    const thread = try std.Thread.spawn(.{}, Appender.run, .{ &appender, writer });
+
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    try std.testing.expect(!appender.done.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), writer.getSequence());
+
+    writer.resumeAppends();
+    thread.join();
+    try std.testing.expect(appender.done.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), appender.seq);
+}
+
+fn writeRawRecord(file: std.fs.File, offset: u64, sequence: u64, data: []const u8, checksum: u32) !u64 {
+    const header = WalEntryHeader{
+        .sequence = sequence,
+        .op_code = test_op,
+        .data_len = @intCast(data.len),
+        .checksum = checksum,
+    };
+    try file.pwriteAll(std.mem.asBytes(&header), offset);
+    try file.pwriteAll(data, offset + HEADER_SIZE);
+    return offset + HEADER_SIZE + data.len;
+}
+
+fn writeValidRecord(file: std.fs.File, offset: u64, sequence: u64, data: []const u8) !u64 {
+    return writeRawRecord(file, offset, sequence, data, std.hash.crc.Crc32.hash(data));
+}
+
+test "a torn tail of at most one batch is trimmed on open" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+
+    var valid_end: u64 = 0;
+    {
+        const file = try tmp.dir.createFile("wal.bin", .{ .read = true });
+        defer file.close();
+        var offset: u64 = 0;
+        offset = try writeValidRecord(file, offset, 1, "one");
+        offset = try writeValidRecord(file, offset, 2, "two");
+        offset = try writeValidRecord(file, offset, 3, "three");
+        valid_end = offset;
+        _ = try writeRawRecord(file, offset, 4, "torn", 0xDEADBEEF);
+        var later: u64 = BLOCK_SIZE;
+        later = try writeValidRecord(file, later, 5, "five");
+        _ = try writeValidRecord(file, later, 6, "six");
+    }
+
+    var writer = try WalWriter.init(std.testing.allocator, dir, 4, 0, false);
+    defer writer.deinit();
+
+    try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
+    const trimmed = try tmp.dir.openFile("wal.bin", .{});
+    defer trimmed.close();
+    try std.testing.expectEqual(valid_end, try trimmed.getEndPos());
+}
+
+test "valid records more than a batch beyond a corrupt record refuse recovery with WalCorrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+
+    {
+        const file = try tmp.dir.createFile("wal.bin", .{ .read = true });
+        defer file.close();
+        _ = try writeRawRecord(file, 0, 1, "corrupt", 0xDEADBEEF);
+        var offset: u64 = BLOCK_SIZE;
+        var sequence: u64 = 2;
+        while (sequence <= 7) : (sequence += 1) offset = try writeValidRecord(file, offset, sequence, "later");
+    }
+
+    try std.testing.expectError(error.WalCorrupt, WalWriter.init(std.testing.allocator, dir, 4, 0, false));
 }

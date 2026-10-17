@@ -19,6 +19,7 @@ pub const WalReader = struct {
     buf_len: usize = 0,
     pos: usize = 0,
     file_pos: u64 = 0,
+    last_sequence: u64 = 0,
 
     const INITIAL_BUF_LEN: usize = 65536;
     const MAX_BUF_LEN: usize = MAX_REPLAY_DATA_LEN + wal.HEADER_SIZE;
@@ -58,6 +59,8 @@ pub const WalReader = struct {
                 continue;
             }
 
+            if (!wal.WalWriter.headerSane(header_aligned, self.last_sequence)) return null;
+
             const data_len: usize = header_aligned.data_len;
             const total_entry_size = header_size + data_len;
 
@@ -79,6 +82,7 @@ pub const WalReader = struct {
 
             self.pos += total_entry_size;
             self.file_pos += total_entry_size;
+            self.last_sequence = entry.sequence;
 
             return entry;
         }

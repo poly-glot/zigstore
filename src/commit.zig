@@ -58,6 +58,14 @@ pub const CommitCompletion = struct {
 /// The returned sequence is the durable — and, under a quorum-awaited commit, replicated — LSN
 /// of this write: hand it back to a reader to fence a read-your-writes path, or await it on a
 /// `CommitGate` out-of-band.
+///
+/// Once a WAL flush has failed the store refuses every further commit with
+/// `error.WalFlushFailed` before serializing or appending anything. The entry whose own fsync
+/// failed was already applied in memory and that visibility cannot be undone in a library: a
+/// consumer must treat `WalFlushFailed` as fatal and crash so recovery rebuilds the in-memory
+/// state from what is actually durable. Before appending, the commit also pulls the page
+/// cache's pressure valve (`store.relieveDirtyPressure()`) so a write burst between two
+/// checkpointer ticks cannot exhaust the no-steal cache.
 pub fn commitSeq(
     comptime Record: type,
     store: anytype,
@@ -69,6 +77,8 @@ pub fn commitSeq(
     options: CommitOptions,
 ) !u64 {
     if (store.read_only.load(.acquire)) return error.ReadOnlyReplica;
+    if (store.flushFailedPublished()) return error.WalFlushFailed;
+    try store.relieveDirtyPressure();
 
     const encoded = try serialize_fn(store.allocator, record);
     defer store.allocator.free(encoded);
@@ -303,4 +313,28 @@ test "completion path: applies synchronously, returns without waiting, records t
     const s3 = try commitSeq(TestRecord, store, 1, .{ .id = 3, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{ .completion = &c3, .await_quorum = false });
     try std.testing.expectEqual(false, c3.needs_quorum);
     try std.testing.expectEqual(s3, store.last_applied_seq);
+}
+
+test "once a WAL flush has failed the store refuses further commits" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    defer store.deinit();
+
+    _ = try commitSeq(TestRecord, store, 1, .{ .id = 1, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{});
+
+    {
+        const w = &store.wal_writer.?;
+        w.lock.lock();
+        defer w.lock.unlock();
+        w.fsync_failed = true;
+        w.flush_failed_pub.store(true, .release);
+    }
+
+    try std.testing.expectError(error.WalFlushFailed, commit(TestRecord, store, 1, .{ .id = 2, .value = 1 }, store, serializeTestRecord, applyTestRecord));
+    try std.testing.expectEqual(@as(u64, 1), store.wal_writer.?.getSequence());
 }
