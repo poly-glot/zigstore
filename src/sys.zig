@@ -36,6 +36,7 @@ pub const Error = error{
     InvalidArgument,
     NameTooLong,
     AddressInUse,
+    BadFileDescriptor,
     Unexpected,
 };
 
@@ -54,6 +55,7 @@ fn check(rc: usize) Error!usize {
         .INVAL => error.InvalidArgument,
         .NAMETOOLONG => error.NameTooLong,
         .ADDRINUSE => error.AddressInUse,
+        .BADF => error.BadFileDescriptor,
         else => error.Unexpected,
     };
 }
@@ -184,11 +186,11 @@ pub fn epollCtl(epoll_fd: fd_t, op: u32, fd: fd_t, event: ?*linux.epoll_event) E
     _ = try check(linux.epoll_ctl(epoll_fd, op, fd, event));
 }
 
-pub fn epollWait(epoll_fd: fd_t, events: []linux.epoll_event, timeout_ms: i32) usize {
+pub fn epollWait(epoll_fd: fd_t, events: []linux.epoll_event, timeout_ms: i32) Error!usize {
     while (true) {
         const rc = linux.epoll_wait(epoll_fd, events.ptr, @intCast(events.len), timeout_ms);
         if (interrupted(rc)) continue;
-        return check(rc) catch 0;
+        return check(rc);
     }
 }
 
@@ -264,4 +266,9 @@ test "preadAll reads back exactly what pwriteAll wrote at the offset" {
 test "open maps a missing path to FileNotFound and a missing feature to OperationNotSupported" {
     try std.testing.expectError(error.FileNotFound, open("/nonexistent-zigstore-dir/x", .{ .ACCMODE = .RDONLY }, 0));
     try std.testing.expectError(error.NameTooLong, open(&@as([linux.PATH_MAX]u8, @splat('a')), .{ .ACCMODE = .RDONLY }, 0));
+}
+
+test "epollWait on a closed descriptor fails instead of reporting an empty poll" {
+    var events: [1]linux.epoll_event = undefined;
+    try std.testing.expectError(error.BadFileDescriptor, epollWait(-1, &events, 0));
 }

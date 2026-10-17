@@ -227,7 +227,7 @@ pub const EpollServer = struct {
 
         while (!signal.shutdownRequested()) {
             const timeout_ms: i32 = if (self.parked_count > 0) PARKED_POLL_MS else 1000;
-            const n = sys.epollWait(self.epoll_fd, &events, timeout_ms);
+            const n = try sys.epollWait(self.epoll_fd, &events, timeout_ms);
 
             self.binary_write_count = 0;
             var got_shutdown = false;
