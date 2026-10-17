@@ -16,17 +16,25 @@ env:
 
 jobs:
   test:
-    name: zig build test (0.15.2)
-    runs-on: ubuntu-24.04
+    name: zig build test (0.15.2, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - name: Check out code
         uses: actions/checkout@v4
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.arch }}-linux-${ZIG_VERSION}.tar.xz" \
             | sudo tar -xJ -C /usr/local
-          echo "/usr/local/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          echo "/usr/local/zig-${{ matrix.arch }}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
       - name: Zig version
         run: zig version
