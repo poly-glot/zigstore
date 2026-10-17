@@ -37,7 +37,7 @@ const TestHeader = extern struct {
     magic: u32 = 0,
     format_version: u32 = 0,
     page_size: u32 = page.PAGE_SIZE,
-    _reserved: [page.PAGE_SIZE - 3 * @sizeOf(u32)]u8 = [_]u8{0} ** (page.PAGE_SIZE - 3 * @sizeOf(u32)),
+    _reserved: [page.PAGE_SIZE - 3 * @sizeOf(u32)]u8 = @splat(0),
 };
 
 const TEST_MAGIC: u32 = 0x5A494753;

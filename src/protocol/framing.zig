@@ -1,6 +1,7 @@
 const std = @import("std");
 const connection = @import("../connection.zig");
 const histogram = @import("../histogram.zig");
+const sys = @import("../sys.zig");
 
 /// Request frame header: `[u32 total_len][u8 op][u8 reserved][u16 count]`.
 pub const REQUEST_HEADER_SIZE: usize = 8;
@@ -116,22 +117,15 @@ pub fn writeRowList(comptime T: type, resp: []u8, op_byte: u8, items: []const T)
 }
 
 fn ReadResult(comptime fields: []const struct { []const u8, type }) type {
-    var sf: [fields.len]std.builtin.Type.StructField = undefined;
+    var names: [fields.len][]const u8 = undefined;
+    var types: [fields.len]type = undefined;
     for (fields, 0..) |f, i| {
-        sf[i] = .{
-            .name = @ptrCast(f[0]),
-            .type = f[1],
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(f[1]),
-        };
+        names[i] = f[0];
+        types[i] = f[1];
     }
-    return @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = &sf,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
+    const frozen_names = names;
+    const frozen_types = types;
+    return @Struct(.auto, null, &frozen_names, &frozen_types, &@splat(.{}));
 }
 
 /// Result of `parsePayload`: the decoded struct plus the unconsumed tail.
@@ -267,9 +261,9 @@ pub fn processFrames(
         const payload = frame[REQUEST_HEADER_SIZE..total_len];
 
         var gate = FrameGate{};
-        const t0 = std.time.nanoTimestamp();
+        const t0 = sys.nanoTimestamp();
         const written = dispatch_fn(ctx, op_byte, payload, count, bp.response_buf[resp_off..], &gate);
-        const t1 = std.time.nanoTimestamp();
+        const t1 = sys.nanoTimestamp();
         const dt: u64 = if (t1 > t0) @intCast(t1 - t0) else 0;
         op_latency[op_byte].recordValue(dt);
 

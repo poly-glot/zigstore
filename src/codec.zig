@@ -52,7 +52,7 @@ pub fn FixedString(comptime N: usize) type {
     }
 
     return extern struct {
-        data: [N]u8 = [_]u8{0} ** N,
+        data: [N]u8 = @splat(0),
         len: u16 = 0,
 
         const Self = @This();
@@ -105,26 +105,13 @@ pub fn CompositeKey(comptime fields: []const [:0]const u8) type {
     const num_fields = fields.len;
     const key_size = num_fields * 8;
 
-    const struct_fields = comptime blk: {
-        var sf: [num_fields]std.builtin.Type.StructField = undefined;
-        for (fields, 0..) |name, i| {
-            sf[i] = .{
-                .name = name,
-                .type = u64,
-                .default_value_ptr = null,
-                .is_comptime = false,
-                .alignment = @alignOf(u64),
-            };
-        }
-        break :blk sf;
+    const field_names = comptime blk: {
+        var names: [num_fields][]const u8 = undefined;
+        for (fields, 0..) |name, i| names[i] = name;
+        break :blk names;
     };
 
-    const GeneratedStruct = @Type(.{ .@"struct" = .{
-        .layout = .@"extern",
-        .fields = &struct_fields,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
+    const GeneratedStruct = @Struct(.@"extern", null, &field_names, &@splat(u64), &@splat(.{}));
 
     return struct {
         /// The decoded key as a struct with one `u64` field per named component.

@@ -16,6 +16,7 @@
 //! application-neutral and lives here.
 
 const std = @import("std");
+const reflect = @import("reflect.zig");
 
 /// Emit `export const enum {name} { Pascal = value, ... }` over an enum type,
 /// mapping each `snake_case` field name to `PascalCase`.
@@ -122,7 +123,7 @@ pub fn writeStructInterface(
     comptime T: type,
 ) !void {
     try w.print("export interface {s} {{\n", .{name});
-    inline for (@typeInfo(T).@"struct".fields) |f| {
+    inline for (comptime reflect.structFields(T)) |f| {
         if (comptime std.mem.startsWith(u8, f.name, "_pad")) continue;
         const camel = comptime fieldNameToCamel(f.name);
         const ts_type = comptime FieldTable.tsType(f.type, f.name);
@@ -143,7 +144,7 @@ pub fn writeStructReader(
 ) !void {
     try w.print("export function read{s}(r: BufferReader): {s} {{\n", .{ name, name });
     var cursor: usize = 0;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
+    inline for (comptime reflect.structFields(T)) |f| {
         const target = @offsetOf(T, f.name);
         if (target > cursor) {
             try w.print("    r.skip({d}); // alignment gap before {s}\n", .{ target - cursor, f.name });
@@ -162,7 +163,7 @@ pub fn writeStructReader(
         try w.print("    r.skip({d}); // tail padding to @sizeOf({s})\n", .{ @sizeOf(T) - cursor, name });
     }
     try w.writeAll("    return {\n");
-    inline for (@typeInfo(T).@"struct".fields) |f| {
+    inline for (comptime reflect.structFields(T)) |f| {
         if (comptime std.mem.startsWith(u8, f.name, "_pad")) continue;
         const camel = comptime fieldNameToCamel(f.name);
         try w.print("        {s},\n", .{camel});
@@ -264,9 +265,9 @@ test "writeStructInterface emits camelCase fields with FieldTable TS types" {
     try writeStructInterface(&fw, StubFieldTable, "Rec", Rec);
     const out = fw.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "export interface Rec {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    id: number;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    displayName: string;") != null);
+    try std.testing.expect(std.mem.find(u8, out, "export interface Rec {") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    id: number;") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    displayName: string;") != null);
 }
 
 test "writeStructReader emits per-field decode expressions from the FieldTable" {
@@ -280,11 +281,11 @@ test "writeStructReader emits per-field decode expressions from the FieldTable" 
     try writeStructReader(&fw, StubFieldTable, "Rec", Rec);
     const out = fw.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "export function readRec(r: BufferReader): Rec {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    const id = r.u64();") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    const displayName = r.fixedString(8);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "        id,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "        displayName,") != null);
+    try std.testing.expect(std.mem.find(u8, out, "export function readRec(r: BufferReader): Rec {") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    const id = r.u64();") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    const displayName = r.fixedString(8);") != null);
+    try std.testing.expect(std.mem.find(u8, out, "        id,") != null);
+    try std.testing.expect(std.mem.find(u8, out, "        displayName,") != null);
 }
 
 test "writeOpEnum maps snake_case enum fields to PascalCase members" {
@@ -295,10 +296,10 @@ test "writeOpEnum maps snake_case enum fields to PascalCase members" {
     try writeOpEnum(&fw, "Op", E);
     const out = fw.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "export const enum Op {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    CreateLink = 1,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    GetLink = 3,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    Ping = 255,") != null);
+    try std.testing.expect(std.mem.find(u8, out, "export const enum Op {") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    CreateLink = 1,") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    GetLink = 3,") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    Ping = 255,") != null);
 }
 
 test "writeStatusMap maps enum values to human-readable strings" {
@@ -309,9 +310,9 @@ test "writeStatusMap maps enum values to human-readable strings" {
     try writeStatusMap(&fw, "STATUS_MSG", E);
     const out = fw.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "export const STATUS_MSG: Record<number, string> = {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    1: \"not found\",") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    6: \"has children\",") != null);
+    try std.testing.expect(std.mem.find(u8, out, "export const STATUS_MSG: Record<number, string> = {") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    1: \"not found\",") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    6: \"has children\",") != null);
 }
 
 const StubKindTable = struct {
@@ -330,10 +331,10 @@ test "writeOpKindMap classifies each op through the KindTable" {
     try writeOpKindMap(&fw, StubKindTable, "OP_KIND", E);
     const out = fw.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "export const OP_KIND: Record<number, \"read\" | \"write\"> = {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    1: \"write\",") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    3: \"read\",") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "    255: \"read\",") != null);
+    try std.testing.expect(std.mem.find(u8, out, "export const OP_KIND: Record<number, \"read\" | \"write\"> = {") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    1: \"write\",") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    3: \"read\",") != null);
+    try std.testing.expect(std.mem.find(u8, out, "    255: \"read\",") != null);
 }
 
 test "writeReadWriteRouter emits the neutral routed client with the LSN fence" {
@@ -342,9 +343,9 @@ test "writeReadWriteRouter emits the neutral routed client with the LSN fence" {
     try writeReadWriteRouter(&fw, "RoutedClient");
     const out = fw.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "export type Transport = (op: number, payload: Uint8Array) => Promise<Uint8Array>;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "export class RoutedClient {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "if (this.opKind[op] !== \"read\") return this.leader(op, payload);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "if (this.readYourWrites && this.replicaAppliedLsn < this.lastWriteLsn) return this.leader(op, payload);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "return this.replica(op, payload);") != null);
+    try std.testing.expect(std.mem.find(u8, out, "export type Transport = (op: number, payload: Uint8Array) => Promise<Uint8Array>;") != null);
+    try std.testing.expect(std.mem.find(u8, out, "export class RoutedClient {") != null);
+    try std.testing.expect(std.mem.find(u8, out, "if (this.opKind[op] !== \"read\") return this.leader(op, payload);") != null);
+    try std.testing.expect(std.mem.find(u8, out, "if (this.readYourWrites && this.replicaAppliedLsn < this.lastWriteLsn) return this.leader(op, payload);") != null);
+    try std.testing.expect(std.mem.find(u8, out, "return this.replica(op, payload);") != null);
 }

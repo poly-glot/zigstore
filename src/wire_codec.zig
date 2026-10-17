@@ -14,6 +14,7 @@
 //!     otherwise each element encoded recursively).
 
 const std = @import("std");
+const reflect = @import("reflect.zig");
 
 /// Errors raised while encoding a struct or field.
 pub const EncodeError = error{
@@ -30,7 +31,7 @@ pub const DecodeError = error{
 
 /// Encode every field of `value` (a struct) into `buf` in declaration order.
 pub fn encodeStruct(a: std.mem.Allocator, buf: *std.ArrayList(u8), value: anytype) EncodeError!void {
-    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |f| {
+    inline for (comptime reflect.structFields(@TypeOf(value))) |f| {
         try encodeField(a, buf, @field(value, f.name));
     }
 }
@@ -66,7 +67,7 @@ pub fn encodeField(a: std.mem.Allocator, buf: *std.ArrayList(u8), value: anytype
 /// Decode a value of struct type `T` from `bytes`, advancing `cur` past the consumed bytes.
 pub fn decodeStruct(arena: std.mem.Allocator, comptime T: type, bytes: []const u8, cur: *usize) DecodeError!T {
     var out: T = undefined;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
+    inline for (comptime reflect.structFields(T)) |f| {
         @field(out, f.name) = try decodeField(arena, f.type, bytes, cur);
     }
     return out;
@@ -91,7 +92,7 @@ pub fn decodeField(arena: std.mem.Allocator, comptime T: type, bytes: []const u8
         },
         .@"enum" => {
             if (cur.* >= bytes.len) return DecodeError.BufferTooShort;
-            const v = std.meta.intToEnum(T, bytes[cur.*]) catch return DecodeError.InvalidEnumValue;
+            const v = std.enums.fromInt(T, bytes[cur.*]) orelse return DecodeError.InvalidEnumValue;
             cur.* += 1;
             return v;
         },
@@ -125,7 +126,7 @@ test "encodeStruct/decodeStruct roundtrip over a generic extern struct" {
     const Rec = extern struct { id: u64, n: u32 };
 
     const allocator = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     const original = Rec{ .id = 0xDEADBEEFCAFEBABE, .n = 1234 };
@@ -167,7 +168,7 @@ test "non-extern struct with int/bool/enum/slice fields roundtrips" {
         .items = items,
     };
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try encodeStruct(allocator, &buf, original);
 
