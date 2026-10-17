@@ -1,3 +1,9 @@
+//! The sharded LRU page cache over `store.dat`. The cache is **no-steal**: eviction only ever
+//! reclaims clean frames, and the one path that writes tree pages to disk is `checkpoint`,
+//! which journals every dirty page (plus the superblock) to `checkpoint.journal` before
+//! writing any of them in place. `redoJournal` replays a complete journal on open, so a crash
+//! at any point leaves `store.dat` either entirely pre-checkpoint or entirely post-checkpoint.
+
 const std = @import("std");
 const posix = std.posix;
 const page = @import("page.zig");
@@ -31,6 +37,31 @@ const CacheShard = struct {
     lock: std.Thread.Mutex,
 };
 
+/// The `checkpoint.journal` magic: ASCII "CKPJ".
+pub const JOURNAL_MAGIC: u32 = 0x434B504A;
+
+/// The `checkpoint.journal` format version.
+pub const JOURNAL_VERSION: u32 = 1;
+
+/// The 32-byte `checkpoint.journal` header, written at offset 0 **after** every record so an
+/// interrupted journal reads as `record_count == 0` or a CRC mismatch. `crc32` covers the
+/// concatenated records (`page_id u32 LE` + `PAGE_SIZE` bytes each).
+pub const JournalHeader = extern struct {
+    magic: u32 = JOURNAL_MAGIC,
+    version: u32 = JOURNAL_VERSION,
+    record_count: u32,
+    _pad: u32 = 0,
+    crc32: u32,
+    _reserved: [12]u8 = [_]u8{0} ** 12,
+};
+
+comptime {
+    if (@sizeOf(JournalHeader) != 32) @compileError("JournalHeader must be 32 bytes");
+}
+
+const JOURNAL_HEADER_SIZE: usize = @sizeOf(JournalHeader);
+const JOURNAL_RECORD_SIZE: usize = @sizeOf(u32) + page.PAGE_SIZE;
+
 pub const PageCache = struct {
     shards: [NUM_SHARDS]CacheShard,
     file: std.fs.File,
@@ -39,6 +70,8 @@ pub const PageCache = struct {
     miss_count: std.atomic.Value(u64),
     page_count: u32,
     alloc_lock: std.Thread.Mutex,
+    capacity: u32,
+    dirty_count: std.atomic.Value(u32),
 
     pub fn init(allocator: std.mem.Allocator, file: std.fs.File, capacity: usize) !PageCache {
         const file_size = file.getEndPos() catch 0;
@@ -56,6 +89,8 @@ pub const PageCache = struct {
             .miss_count = std.atomic.Value(u64).init(0),
             .page_count = pc,
             .alloc_lock = .{},
+            .capacity = @intCast(per_shard * NUM_SHARDS),
+            .dirty_count = std.atomic.Value(u32).init(0),
         };
 
         var built: usize = 0;
@@ -95,10 +130,14 @@ pub const PageCache = struct {
         return self;
     }
 
+    /// Free every frame. Writes nothing: dirty pages that were never checkpointed are dropped
+    /// (and reported at `warn`, since a deliberate crash-close reaches this path too), because
+    /// the store checkpoints before tearing its cache down.
     pub fn deinit(self: *PageCache) void {
-        self.flushAll() catch |err| {
-            std.log.err("PageCache.deinit: failed to flush dirty pages: {}", .{err});
-        };
+        const dropped = self.dirty_count.load(.acquire);
+        if (dropped > 0) {
+            log.warn("PageCache.deinit: dropping {d} dirty pages that were never checkpointed", .{dropped});
+        }
         for (&self.shards) |*shard| {
             shard.map.deinit();
             shard.free_list.deinit(self.allocator);
@@ -126,28 +165,34 @@ pub const PageCache = struct {
         if (shard.map.get(page_id)) |entry| {
             _ = self.hit_count.fetchAdd(1, .monotonic);
             entry.pin_count += 1;
-            if (mark_dirty) entry.dirty = true;
+            if (mark_dirty) self.markDirty(entry);
             moveToFront(shard, entry);
             return @ptrCast(@alignCast(&entry.data));
         }
 
         _ = self.miss_count.fetchAdd(1, .monotonic);
 
-        const entry = try getFreeShard(self, shard);
-        try readFromDisk(page_id, &entry.data, self.file.handle);
-        entry.page_id = page_id;
-        entry.dirty = mark_dirty;
-        entry.pin_count = 1;
-
-        shard.map.put(page_id, entry) catch {
+        const entry = try getFreeShard(shard);
+        errdefer {
             entry.page_id = page.INVALID_PAGE;
             entry.pin_count = 0;
             shard.free_list.appendAssumeCapacity(entry);
-            return error.OutOfMemory;
-        };
+        }
+        try readFromDisk(page_id, &entry.data, self.file.handle);
+        try shard.map.put(page_id, entry);
+
+        entry.page_id = page_id;
+        entry.pin_count = 1;
+        if (mark_dirty) self.markDirty(entry);
         moveToFront(shard, entry);
 
         return @ptrCast(@alignCast(&entry.data));
+    }
+
+    fn markDirty(self: *PageCache, entry: *CacheEntry) void {
+        if (entry.dirty) return;
+        entry.dirty = true;
+        _ = self.dirty_count.fetchAdd(1, .acq_rel);
     }
 
     pub fn unpinPage(self: *PageCache, page_id: page.PageId) void {
@@ -162,19 +207,37 @@ pub const PageCache = struct {
         }
     }
 
-    pub fn flushPage(self: *PageCache, page_id: page.PageId) !void {
-        const shard = &self.shards[shardIndex(page_id)];
-        shard.lock.lock();
-        defer shard.lock.unlock();
-
-        const entry = shard.map.get(page_id) orelse return CacheError.PageNotFound;
-        if (entry.dirty) {
-            try writeToDisk(page_id, &entry.data, self.file.handle);
-            entry.dirty = false;
-        }
+    /// Whether at least half of the frames hold dirty pages. The store uses this as the
+    /// pressure valve that triggers a page flush before eviction can run out of clean frames.
+    pub fn dirtyPressureHigh(self: *const PageCache) bool {
+        return self.dirty_count.load(.acquire) >= self.capacity / 2;
     }
 
-    pub fn flushAll(self: *PageCache) !void {
+    /// Write every dirty page and the supplied superblock image to disk, atomically with
+    /// respect to a crash. Journal phase: each dirty page (checksum stamped) is appended to
+    /// `journal` as `page_id` + bytes, the header page last as page 0, then the journal header
+    /// is written and the journal fsynced. In-place phase: the same images are written to
+    /// `store.dat` (header page last), `fdatasync`ed, and the pages marked clean. The caller
+    /// holds the store's drain and apply locks so nothing dirties a page between the two phases,
+    /// and empties the journal afterward. The only path that writes tree pages.
+    pub fn checkpoint(self: *PageCache, journal: std.fs.File, header_page: *const [page.PAGE_SIZE]u8) !void {
+        _ = try self.writeJournal(journal, header_page);
+        try self.writeDirtyPagesInPlace();
+        try self.file.pwriteAll(header_page, 0);
+        posix.fdatasync(self.file.handle) catch |err| {
+            log.err("checkpoint: fdatasync failed: {}", .{err});
+            return CacheError.DiskError;
+        };
+        self.markAllClean();
+    }
+
+    fn writeJournal(self: *PageCache, journal: std.fs.File, header_page: *const [page.PAGE_SIZE]u8) !u32 {
+        try journal.setEndPos(0);
+
+        var crc = std.hash.crc.Crc32.init();
+        var offset: u64 = JOURNAL_HEADER_SIZE;
+        var count: u32 = 0;
+
         for (&self.shards) |*shard| {
             shard.lock.lock();
             defer shard.lock.unlock();
@@ -182,17 +245,105 @@ pub const PageCache = struct {
             var it = shard.map.iterator();
             while (it.next()) |kv| {
                 const entry = kv.value_ptr.*;
-                if (entry.dirty) {
-                    try writeToDisk(kv.key_ptr.*, &entry.data, self.file.handle);
-                    entry.dirty = false;
-                }
+                if (!entry.dirty) continue;
+                stampChecksum(&entry.data);
+                try appendJournalRecord(journal, &crc, &offset, entry.page_id, &entry.data);
+                count += 1;
             }
         }
 
-        posix.fdatasync(self.file.handle) catch |err| {
-            log.err("flushAll: fdatasync failed: {}", .{err});
+        try appendJournalRecord(journal, &crc, &offset, 0, header_page);
+        count += 1;
+
+        const header = JournalHeader{ .record_count = count, .crc32 = crc.final() };
+        try journal.pwriteAll(std.mem.asBytes(&header), 0);
+        try journal.sync();
+        return count;
+    }
+
+    fn appendJournalRecord(journal: std.fs.File, crc: *std.hash.crc.Crc32, offset: *u64, page_id: page.PageId, data: *const [page.PAGE_SIZE]u8) !void {
+        var id_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &id_bytes, page_id, .little);
+        crc.update(&id_bytes);
+        crc.update(data);
+        try journal.pwriteAll(&id_bytes, offset.*);
+        try journal.pwriteAll(data, offset.* + id_bytes.len);
+        offset.* += JOURNAL_RECORD_SIZE;
+    }
+
+    fn writeDirtyPagesInPlace(self: *PageCache) !void {
+        for (&self.shards) |*shard| {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+
+            var it = shard.map.iterator();
+            while (it.next()) |kv| {
+                const entry = kv.value_ptr.*;
+                if (!entry.dirty) continue;
+                try self.file.pwriteAll(&entry.data, @as(u64, entry.page_id) * page.PAGE_SIZE);
+            }
+        }
+    }
+
+    fn markAllClean(self: *PageCache) void {
+        for (&self.shards) |*shard| {
+            shard.lock.lock();
+            defer shard.lock.unlock();
+
+            var it = shard.map.iterator();
+            while (it.next()) |kv| {
+                const entry = kv.value_ptr.*;
+                if (!entry.dirty) continue;
+                entry.dirty = false;
+                _ = self.dirty_count.fetchSub(1, .acq_rel);
+            }
+        }
+    }
+
+    /// Replay a `checkpoint.journal` left behind by a crash into `file`. Returns `true` when
+    /// the journal was complete (magic, version, count, and CRC all valid) and every image has
+    /// been written and `fdatasync`ed; `false` when it was incomplete or invalid and `file` was
+    /// left untouched. The caller empties the journal either way.
+    pub fn redoJournal(journal: std.fs.File, file: std.fs.File) !bool {
+        const record_count = (try completeJournalRecordCount(journal)) orelse return false;
+        try applyJournalRecords(journal, file, record_count);
+        posix.fdatasync(file.handle) catch |err| {
+            log.err("redoJournal: fdatasync failed: {}", .{err});
             return CacheError.DiskError;
         };
+        return true;
+    }
+
+    fn completeJournalRecordCount(journal: std.fs.File) !?u32 {
+        var header_buf: [JOURNAL_HEADER_SIZE]u8 = undefined;
+        const n = try journal.preadAll(&header_buf, 0);
+        if (n < JOURNAL_HEADER_SIZE) return null;
+
+        const header = std.mem.bytesToValue(JournalHeader, &header_buf);
+        if (header.magic != JOURNAL_MAGIC or header.version != JOURNAL_VERSION or header.record_count == 0) return null;
+
+        const needed = JOURNAL_HEADER_SIZE + @as(u64, header.record_count) * JOURNAL_RECORD_SIZE;
+        if ((try journal.getEndPos()) < needed) return null;
+
+        var crc = std.hash.crc.Crc32.init();
+        var record: [JOURNAL_RECORD_SIZE]u8 = undefined;
+        for (0..header.record_count) |i| {
+            const got = try journal.preadAll(&record, JOURNAL_HEADER_SIZE + i * JOURNAL_RECORD_SIZE);
+            if (got < JOURNAL_RECORD_SIZE) return null;
+            crc.update(&record);
+        }
+        if (crc.final() != header.crc32) return null;
+        return header.record_count;
+    }
+
+    fn applyJournalRecords(journal: std.fs.File, file: std.fs.File, record_count: u32) !void {
+        var record: [JOURNAL_RECORD_SIZE]u8 = undefined;
+        for (0..record_count) |i| {
+            const got = try journal.preadAll(&record, JOURNAL_HEADER_SIZE + i * JOURNAL_RECORD_SIZE);
+            if (got < JOURNAL_RECORD_SIZE) return CacheError.DiskError;
+            const page_id = std.mem.readInt(u32, record[0..4], .little);
+            try file.pwriteAll(record[4..], @as(u64, page_id) * page.PAGE_SIZE);
+        }
     }
 
     pub fn allocatePage(self: *PageCache) !page.PageId {
@@ -231,22 +382,17 @@ pub const PageCache = struct {
         if (shard.tail == null) shard.tail = entry;
     }
 
-    fn getFreeShard(self: *PageCache, shard: *CacheShard) !*CacheEntry {
+    fn getFreeShard(shard: *CacheShard) !*CacheEntry {
         if (shard.free_list.items.len > 0) {
             return shard.free_list.pop().?;
         }
-        return try evictOneShard(self, shard);
+        return try evictOneShard(shard);
     }
 
-    fn evictOneShard(self: *PageCache, shard: *CacheShard) !*CacheEntry {
+    fn evictOneShard(shard: *CacheShard) !*CacheEntry {
         var cursor = shard.tail;
         while (cursor) |entry| {
-            if (entry.pin_count == 0) {
-                if (entry.dirty) {
-                    try writeToDisk(entry.page_id, &entry.data, self.file.handle);
-                    entry.dirty = false;
-                }
-
+            if (entry.pin_count == 0 and !entry.dirty) {
                 if (entry.prev) |prev| prev.next = entry.next;
                 if (entry.next) |nxt| nxt.prev = entry.prev;
                 if (shard.head == entry) shard.head = entry.next;
@@ -289,18 +435,9 @@ pub const PageCache = struct {
         }
     }
 
-    fn writeToDisk(page_id: page.PageId, buf: *const [page.PAGE_SIZE]u8, file_handle: std.posix.fd_t) !void {
-        const mutable_buf: *[page.PAGE_SIZE]u8 = @constCast(buf);
-        const pg: *page.Page = @ptrCast(@alignCast(mutable_buf));
+    fn stampChecksum(buf: *[page.PAGE_SIZE]u8) void {
+        const pg: *page.Page = @ptrCast(@alignCast(buf));
         pg.header.checksum = page.computeChecksum(pg);
-
-        const offset: u64 = @as(u64, page_id) * page.PAGE_SIZE;
-        var total_written: usize = 0;
-        while (total_written < page.PAGE_SIZE) {
-            const n = std.posix.pwrite(file_handle, buf[total_written..], offset + total_written) catch return CacheError.DiskError;
-            if (n == 0) return CacheError.DiskError;
-            total_written += n;
-        }
     }
 };
 
@@ -311,7 +448,7 @@ fn createTempFile() !std.fs.File {
     });
 }
 
-test "basic get and flush" {
+test "basic get, unpin, and re-fetch" {
     const file = try createTempFile();
     defer file.close();
     defer std.fs.cwd().deleteFile("/tmp/test_page_cache.db") catch {};
@@ -326,14 +463,15 @@ test "basic get and flush" {
     try page.insertEntry(@ptrCast(@alignCast(pg)), "hello", "world", 0);
     cache.unpinPage(pid);
 
-    try cache.flushPage(pid);
-
     const pg2 = try cache.getPage(pid);
     const p2: *const page.Page = @ptrCast(@alignCast(pg2));
     const slots = page.getSlots(p2);
     try std.testing.expectEqual(@as(u16, 1), p2.header.key_count);
     try std.testing.expectEqualSlices(u8, "hello", page.getKeyAt(p2, slots[0]));
     cache.unpinPage(pid);
+
+    try std.testing.expectEqual(@as(u32, 1), cache.dirty_count.load(.acquire));
+    cache.markAllClean();
 }
 
 test "eviction of LRU" {
@@ -352,11 +490,11 @@ test "eviction of LRU" {
     const extra = try cache.allocatePage();
     pids[1] = extra;
 
-    const pg0 = try cache.getPageMut(pids[0]);
+    const pg0 = try cache.getPage(pids[0]);
     _ = pg0;
     cache.unpinPage(pids[0]);
 
-    const pg1 = try cache.getPageMut(pids[1]);
+    const pg1 = try cache.getPage(pids[1]);
     _ = pg1;
     cache.unpinPage(pids[1]);
 
@@ -378,13 +516,13 @@ test "pin prevents eviction" {
     const pid1: page.PageId = 0;
     const pid2: page.PageId = @intCast(NUM_SHARDS);
 
-    _ = try cache.getPageMut(pid1);
+    _ = try cache.getPage(pid1);
 
-    const result = cache.getPageMut(pid2);
+    const result = cache.getPage(pid2);
     try std.testing.expectError(CacheError.CacheFull, result);
 
     cache.unpinPage(pid1);
-    const pg2 = try cache.getPageMut(pid2);
+    const pg2 = try cache.getPage(pid2);
     _ = pg2;
     cache.unpinPage(pid2);
 }
@@ -424,35 +562,6 @@ test "LRU evicts oldest unpinned" {
     try std.testing.expect(shard.map.get(c) != null);
 }
 
-test "dirty page persists across re-fetch via flushAll" {
-    const path = "/tmp/test_page_cache_dirty.db";
-    const file = try createTempFileAt(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
-
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 4);
-    defer cache.deinit();
-
-    const pid = try cache.allocatePage();
-    const pg = try cache.getPageMut(pid);
-    page.initLeaf(@ptrCast(@alignCast(pg)), pid);
-    try page.insertEntry(@ptrCast(@alignCast(pg)), "k1", "v1", 0);
-    cache.unpinPage(pid);
-
-    try cache.flushAll();
-
-    const shard = &cache.shards[shardIndexExternal(pid)];
-    shard.lock.lock();
-    const entry = shard.map.get(pid).?;
-    try std.testing.expectEqual(false, entry.dirty);
-    shard.lock.unlock();
-
-    const pg2 = try cache.getPage(pid);
-    const p2: *const page.Page = @ptrCast(@alignCast(pg2));
-    try std.testing.expectEqual(@as(u32, 1), p2.header.key_count);
-    cache.unpinPage(pid);
-}
-
 fn shardIndexExternal(pid: page.PageId) usize {
     return @as(usize, pid) % NUM_SHARDS;
 }
@@ -478,6 +587,7 @@ test "cross-shard pages access without contention" {
     page.initLeaf(@ptrCast(@alignCast(b)), pid_b);
     cache.unpinPage(pid_a);
     cache.unpinPage(pid_b);
+    cache.markAllClean();
 }
 
 test "re-pin after unpin returns same bytes" {
@@ -503,13 +613,26 @@ test "re-pin after unpin returns same bytes" {
     try std.testing.expectEqual(@as(u32, 1), p.header.key_count);
     try std.testing.expectEqualSlices(u8, "alpha", page.getKeyAt(p, slots[0]));
     cache.unpinPage(pid);
+    cache.markAllClean();
 }
 
-test "evicting dirty page flushes to disk first" {
-    const path = "/tmp/test_page_cache_evictdirty.db";
-    const file = try createTempFileAt(path);
+fn fillLeaf(cache: *PageCache, pid: page.PageId, key: []const u8, value: []const u8) !void {
+    const pg = try cache.getPageMut(pid);
+    page.initLeaf(pg, pid);
+    try page.insertEntry(pg, key, value, 0);
+    cache.unpinPage(pid);
+}
+
+fn readPageBytes(file: std.fs.File, pid: page.PageId, out: *[page.PAGE_SIZE]u8) !void {
+    const got = try file.preadAll(out, @as(u64, pid) * page.PAGE_SIZE);
+    try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), got);
+}
+
+test "a dirty page is never evicted: when every unpinned frame is dirty the cache reports CacheFull" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile("store.dat", .{ .read = true });
     defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
 
     var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS);
     defer cache.deinit();
@@ -518,26 +641,86 @@ test "evicting dirty page flushes to disk first" {
 
     const a: page.PageId = 0;
     const b: page.PageId = @intCast(NUM_SHARDS);
+    try fillLeaf(&cache, a, "k", "v");
+    try std.testing.expectEqual(@as(u32, 1), cache.dirty_count.load(.acquire));
 
+    try std.testing.expectError(CacheError.CacheFull, cache.getPage(b));
+
+    const journal = try tmp.dir.createFile("checkpoint.journal", .{ .read = true });
+    defer journal.close();
+    const header_page = [_]u8{0} ** page.PAGE_SIZE;
+    try cache.checkpoint(journal, &header_page);
+    try std.testing.expectEqual(@as(u32, 0), cache.dirty_count.load(.acquire));
+
+    _ = try cache.getPage(b);
+    cache.unpinPage(b);
+}
+
+test "dirty pages reach disk only through checkpoint: a crash before it leaves store.dat untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile("store.dat", .{ .read = true });
+    defer file.close();
+
+    var pid: page.PageId = undefined;
     {
-        const pg = try cache.getPageMut(a);
-        page.initLeaf(@ptrCast(@alignCast(pg)), a);
-        try page.insertEntry(@ptrCast(@alignCast(pg)), "evk", "evv", 0);
-        cache.unpinPage(a);
+        var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 2);
+        defer cache.deinit();
+        pid = try cache.allocatePage();
+        try fillLeaf(&cache, pid, "lost", "on-crash");
+        try std.testing.expectEqual(@as(u32, 1), cache.dirty_count.load(.acquire));
     }
 
+    var on_disk: [page.PAGE_SIZE]u8 = undefined;
+    try readPageBytes(file, pid, &on_disk);
+    try std.testing.expect(std.mem.allEqual(u8, &on_disk, 0));
+}
+
+test "a complete journal is redone on open and an incomplete one is discarded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = try tmp.dir.createFile("source.dat", .{ .read = true });
+    defer source.close();
+
+    var header_page = [_]u8{0} ** page.PAGE_SIZE;
+    header_page[0] = 0xAB;
+
+    const journal = try tmp.dir.createFile("checkpoint.journal", .{ .read = true });
+    defer journal.close();
+
+    var pid: page.PageId = undefined;
     {
-        const pg = try cache.getPageMut(b);
-        page.initLeaf(@ptrCast(@alignCast(pg)), b);
-        cache.unpinPage(b);
+        var cache = try PageCache.init(std.testing.allocator, source, NUM_SHARDS * 2);
+        defer cache.deinit();
+        pid = try cache.allocatePage();
+        try fillLeaf(&cache, pid, "journaled", "page");
+        try std.testing.expectEqual(@as(u32, 2), try cache.writeJournal(journal, &header_page));
+        cache.markAllClean();
     }
 
-    const before_misses = cache.miss_count.load(.monotonic);
-    const re = try cache.getPage(a);
-    const p: *const page.Page = @ptrCast(@alignCast(re));
-    try std.testing.expectEqual(@as(u32, 1), p.header.key_count);
-    cache.unpinPage(a);
-    try std.testing.expect(cache.miss_count.load(.monotonic) > before_misses);
+    const target = try tmp.dir.createFile("target.dat", .{ .read = true });
+    defer target.close();
+    try target.setEndPos(@as(u64, pid + 1) * page.PAGE_SIZE);
+
+    try std.testing.expect(try PageCache.redoJournal(journal, target));
+
+    var redone: [page.PAGE_SIZE]u8 align(4096) = undefined;
+    try readPageBytes(target, pid, &redone);
+    const pg: *const page.Page = @ptrCast(@alignCast(&redone));
+    try std.testing.expect(page.verifyChecksum(pg));
+    try std.testing.expectEqualSlices(u8, "journaled", page.getKeyAt(pg, page.getSlots(pg)[0]));
+    try readPageBytes(target, 0, &redone);
+    try std.testing.expectEqual(@as(u8, 0xAB), redone[0]);
+
+    const journal_size = try journal.getEndPos();
+    try journal.setEndPos(journal_size - 1);
+    const untouched = try tmp.dir.createFile("untouched.dat", .{ .read = true });
+    defer untouched.close();
+    try untouched.setEndPos(@as(u64, pid + 1) * page.PAGE_SIZE);
+
+    try std.testing.expect(!try PageCache.redoJournal(journal, untouched));
+    try readPageBytes(untouched, pid, &redone);
+    try std.testing.expect(std.mem.allEqual(u8, &redone, 0));
 }
 
 test "concurrent allocatePage across threads" {

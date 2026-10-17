@@ -532,6 +532,12 @@ test "stress: phase-9 shape — iter one tree while inserting into another (shar
     defer cache.deinit();
     var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
 
+    const journal_path = "/tmp/test_btree_stress_phase9.journal";
+    const journal = try createTempFile(journal_path);
+    defer journal.close();
+    defer std.fs.cwd().deleteFile(journal_path) catch {};
+    const header_page = [_]u8{0} ** page.PAGE_SIZE;
+
     var existing_tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
     var slug_tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
 
@@ -545,6 +551,7 @@ test "stress: phase-9 shape — iter one tree while inserting into another (shar
         while (i < N) : (i += 1) {
             std.mem.writeInt(u64, &key_buf, i + 1, .big);
             try existing_tree.insert(&key_buf, &val_buf);
+            if (cache.dirtyPressureHigh()) try cache.checkpoint(journal, &header_page);
         }
     }
 
@@ -579,6 +586,7 @@ test "stress: phase-9 shape — iter one tree while inserting into another (shar
 
         std.mem.writeInt(u64, &val_buf, i, .big);
         try slug_tree.insert(key_buf[0..pos], &val_buf);
+        if (cache.dirtyPressureHigh()) try cache.checkpoint(journal, &header_page);
         i += 1;
     }
 
