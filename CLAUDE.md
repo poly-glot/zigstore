@@ -16,6 +16,14 @@ live in [`.claude/rules/`](.claude/rules/). Read them.
 - **Declarative, testable, maintainable.** Senior-level code: clear names, focused units, no
   clever one-liners, behavior covered by tests.
 
+## Durability
+
+- **Lock order is `mt_drain_mutex` → `apply_mutex`**, everywhere in the engine. A consumer
+  `apply_fn` runs under `apply_mutex` and must never drain, flush, or checkpoint.
+- **The only writer of tree pages is `PageCache.checkpoint`** (journal first, then in place).
+  Eviction never writes a dirty page; `Store.checkpoint`/`flushPages` are the only callers.
+- **`header.seq`** means every WAL entry at or below it is fully in the on-disk tree.
+
 ## The boundary is the product
 
 `zigstore` knows nothing about any consumer's records, hierarchy, slugs, or statuses. The

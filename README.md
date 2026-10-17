@@ -41,7 +41,7 @@ From that one declaration the engine generates, at comptime:
 
 ## Status
 
-A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (173 tests
+A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (211 tests
 plus a `-Dcpu=baseline` build). Every layer is implemented:
 
 | Surface | State |
@@ -49,8 +49,8 @@ plus a `-Dcpu=baseline` build). Every layer is implemented:
 | `codec`: `FixedString`, `CompositeKey`, `encodeU64`/`decodeU64`, `Serializable`, `hash` | implemented |
 | `schema` / `Engine(schema)`: typed `Header`, named trees, persisted counters | implemented |
 | Paged storage (16 KB slotted pages, sharded LRU cache, on-page freelist) + a `[]const u8`-keyed B+Tree | implemented |
-| WAL durability + replay, memtables, bloom filter, snapshot/checkpoint, crash recovery | implemented |
-| `recover` / `spawnWorker` / seq-gated `commit` / `SnapshotHost` runtime seams | implemented |
+| WAL durability + replay, memtables, bloom filter, atomic journaled checkpoint, crash recovery | implemented |
+| `recover` / `spawnWorker` / `spawnCheckpointer` / seq-gated `commit` / `SnapshotHost` runtime seams | implemented |
 | epoll reactor + binary-protocol framing/TLV codec + `run` / `ServerConfig` | implemented |
 | `replication`: streaming-standby `Hub`/`Receiver`, base-backup bootstrap (`fetchBaseBackup`), retain floor, `CommitGate` quorum, `promote`/`demote` | implemented |
 | reflection-driven TypeScript-client codegen (`tsgen`), incl. read/write split (`writeOpKindMap` + `writeReadWriteRouter`) | implemented |
@@ -107,11 +107,43 @@ const next = store.nextId("next_link_id");        // persisted counter, allocate
 store.counter("next_link_id").* = 0;              // *u64 into the header (single-writer)
 
 try store.drainMemtables();                       // flush the write memtables into the trees
+_ = try store.checkpoint();                       // drain + write pages/header atomically + truncate WAL
 ```
 
 The dynamic seams stay runtime callbacks the consumer supplies: `store.recover(ctx, .{ .apply_entry, .on_replayed, .bootstrap })`, `store.spawnWorker(ctx, .{ .interval_ns, .tick })`, `zigstore.commit(Record, store, op_code, record, ctx, serialize_fn, apply_fn)`, snapshot over a `SnapshotHost`, health/readiness facts via `store.healthStatus()`, replication over `store.primaryHost()` / `store.replicaHost(ctx, apply_entry)` (`zigstore.replication.Hub.start` on the leader, `Receiver.start` on a standby — see [`docs/design/replication-streaming-standby.md`](docs/design/replication-streaming-standby.md)), `zigstore.protocol.processFrames(ctx, conn, dispatch_fn, op_latency, response_reserve)`, and `zigstore.run(Store, ctx, handler, config)`.
 
 See [`examples/basic.zig`](examples/basic.zig) for a full directory-shaped store driven end to end.
+
+### Durability model
+
+- **A WAL append is acknowledged after `fdatasync`.** `commit` returns once its entry is in
+  `wal.bin` and the group-commit flusher has `fdatasync`ed it (and, with a `CommitGate`, once
+  the quorum has acked).
+- **The page cache is no-steal.** Eviction only reclaims clean frames; a dirty page is never
+  written to `store.dat` by eviction. The only writer of tree pages is `PageCache.checkpoint`.
+- **A checkpoint is atomic.** `store.checkpoint()` takes `mt_drain_mutex` then `apply_mutex`,
+  pauses WAL appends and waits for every appended entry to apply, drains the memtables into
+  their trees, then writes every dirty page plus the superblock first to `checkpoint.journal`
+  (fsynced, CRC-covered) and only then in place (header page last), `fdatasync`s `store.dat`,
+  empties the journal, and truncates the WAL. A crash at any point leaves `store.dat` either
+  entirely pre- or entirely post-checkpoint: `Store.init` redoes a complete journal and discards
+  an incomplete one before reading the header. The journal file is created once per store and
+  stays open and empty between checkpoints.
+- **`header.seq`** is the WAL sequence up to which every entry is fully contained in the on-disk
+  tree. `recover` replays only entries above it, and the WAL sequence resumes from it on open
+  even when `snapshot.meta` is absent.
+- **The pressure valve.** When at least half the cache frames are dirty, `store.flushPages()`
+  writes them through the same journal without draining memtables or advancing `header.seq`.
+  `commit`, `drainMemtables`, and `recover` pull the valve themselves; `spawnCheckpointer(interval_s)`
+  spawns a worker that pulls it every second and runs a full `checkpoint` every `interval_s`.
+- **Lock order** everywhere: `mt_drain_mutex` → `apply_mutex`. A consumer's `apply_fn` runs
+  under `apply_mutex` and must not call `drainMemtables`, `flushPages`, or `checkpoint`.
+- **What two errors mean for a consumer.** `error.WalFlushFailed`: a WAL `fdatasync` failed;
+  the store refuses every further commit, and the in-memory effect of the failed entry cannot be
+  undone, so crash and restart (recovery rebuilds from what is durable). `error.WalCorrupt`
+  (from `Store.init`): `wal.bin` has valid records more than one batch beyond a corrupt one,
+  which a torn tail cannot produce; the store refuses to start rather than silently drop data.
+  A torn tail of at most one batch is trimmed on open.
 
 ### Scale writes: `ShardSet`
 
@@ -156,8 +188,8 @@ zig fmt --check src/ examples/ build.zig
 ```
 
 The paged storage uses Linux `O_DIRECT`/`fallocate`, so `zig build test` runs in the Linux
-devcontainer (or any Linux host with Zig 0.15.2); CI runs it on Zig 0.15.2 plus a
-`-Dcpu=baseline` build.
+devcontainer (or any Linux host with Zig 0.15.2); CI runs it on Zig 0.15.2 on both x86_64 and
+arm64 (`ubuntu-24.04-arm`) plus a `-Dcpu=baseline` build.
 
 ## Versioning
 
