@@ -119,11 +119,20 @@ pub const MemTable = struct {
         for (&self.shards) |*s| s.lock.unlock();
     }
 
-    pub fn swapShardLocked(self: *MemTable, i: usize) *Buffer {
+    pub fn swapShardLocked(self: *MemTable, i: usize) !*Buffer {
         const s = &self.shards[i];
-        const tmp = s.front;
-        s.front = s.back;
-        s.back = tmp;
+        if (s.back.map.count() == 0) {
+            const tmp = s.front;
+            s.front = s.back;
+            s.back = tmp;
+            return &s.back;
+        }
+
+        var it = s.front.map.iterator();
+        while (it.next()) |kv| {
+            try putInto(&s.back, kv.key_ptr.*, kv.value_ptr.value, kv.value_ptr.tombstone);
+        }
+        s.front.reset();
         return &s.back;
     }
 
@@ -220,7 +229,7 @@ test "MemTable swap and drain" {
     mt.lockAll();
     var total_back: u32 = 0;
     for (0..NUM_SHARDS) |i| {
-        const back = mt.swapShardLocked(i);
+        const back = try mt.swapShardLocked(i);
         total_back += back.map.count();
     }
     mt.unlockAll();
@@ -264,7 +273,7 @@ test "a row a drain swapped into the back buffer stays visible until the drain r
 
     try mt.put("swapped", "value");
     mt.lockAll();
-    for (0..NUM_SHARDS) |i| _ = mt.swapShardLocked(i);
+    for (0..NUM_SHARDS) |i| _ = try mt.swapShardLocked(i);
     mt.unlockAll();
 
     try std.testing.expectEqualSlices(u8, "value", mt.get("swapped").found);
@@ -283,7 +292,7 @@ test "a tombstone written during a drain shadows the swapped-out value" {
 
     try mt.put("k", "old");
     mt.lockAll();
-    for (0..NUM_SHARDS) |i| _ = mt.swapShardLocked(i);
+    for (0..NUM_SHARDS) |i| _ = try mt.swapShardLocked(i);
     mt.unlockAll();
 
     try mt.delete("k");
@@ -291,4 +300,33 @@ test "a tombstone written during a drain shadows the swapped-out value" {
 
     try mt.put("k", "new");
     try std.testing.expectEqualSlices(u8, "new", mt.get("k").found);
+}
+
+test "a drain that fails midway keeps the newest value visible and the retry drains it" {
+    var mt = MemTable.init(std.testing.allocator);
+    defer mt.deinit();
+
+    try mt.put("k", "v1");
+    try mt.put("other", "o1");
+    mt.lockAll();
+    for (0..NUM_SHARDS) |i| _ = try mt.swapShardLocked(i);
+    mt.unlockAll();
+
+    try mt.put("k", "v2");
+    try std.testing.expectEqualSlices(u8, "v2", mt.get("k").found);
+
+    mt.lockAll();
+    var total_back: u32 = 0;
+    for (0..NUM_SHARDS) |i| total_back += (try mt.swapShardLocked(i)).map.count();
+    mt.unlockAll();
+
+    try std.testing.expectEqual(@as(u32, 2), total_back);
+    try std.testing.expectEqual(@as(u32, 0), mt.count());
+    try std.testing.expectEqualSlices(u8, "v2", mt.get("k").found);
+    try std.testing.expectEqualSlices(u8, "o1", mt.get("other").found);
+
+    mt.lockAll();
+    for (0..NUM_SHARDS) |i| mt.resetShardBackLocked(i);
+    mt.unlockAll();
+    try std.testing.expect(mt.get("k") == .not_found);
 }
