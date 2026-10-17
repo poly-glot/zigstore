@@ -526,6 +526,15 @@ pub fn Engine(comptime s: Schema) type {
             try self.drainMemtablesLocked(false);
         }
 
+        /// Drain one memtable into its tree under `mt_drain_mutex`, pulling the pressure valve
+        /// between rows exactly as `drainMemtables` does. For a consumer that needs a single
+        /// index settled before a tree scan; the caller must not hold any engine lock.
+        pub fn drainMemtableInto(self: *Store, mt: *MemTable, dst: *BPlusTree) !void {
+            self.mt_drain_mutex.lock();
+            defer self.mt_drain_mutex.unlock();
+            try self.drainOne(mt, dst, false);
+        }
+
         fn drainMemtablesLocked(self: *Store, apply_held: bool) !void {
             inline for (s.memtable_indexes) |name| {
                 try self.drainOne(&@field(self.memtables, name), &@field(self.trees, name), apply_held);
