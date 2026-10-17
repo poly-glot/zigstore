@@ -24,6 +24,23 @@ live in [`.claude/rules/`](.claude/rules/). Read them.
   Eviction never writes a dirty page; `Store.checkpoint`/`flushPages` are the only callers.
 - **`header.seq`** means every WAL entry at or below it is fully in the on-disk tree.
 
+## `std.Io` stays off the hot path
+
+- **Public constructors take `io: std.Io` first** (`Store.init`, `ShardSet.init`, `WalWriter.init`,
+  `PageCache.init`, `Hub.start`, `Receiver.start`, `fetchBaseBackup`, `SnapshotManager.init`);
+  `ServerConfig.fromEnv` takes the process `Environ.Map`. Locks are `std.Io.Mutex`/`Condition`/
+  `RwLock` driven by that `io`; the cold path (create, rename, copy, delete, stat, snapshot and
+  shard meta, the replay reader) uses `std.Io.Dir`/`std.Io.File`; tests use `std.testing.io`.
+- **The hot path is `io`-free.** The `O_DIRECT` WAL, page reads/writes, the checkpoint journal
+  phases, the epoll reactor, and the replication byte loops go through `src/sys.zig` (raw Linux
+  syscalls, `EINTR` retried). Do not route them through `std.Io`: `O_DIRECT` needs single
+  aligned `pwrite`s and the reactor needs non-blocking fds, and the on-disk and wire formats
+  must stay byte-identical across the port.
+- **Reflection goes through `src/reflect.zig`** (`structFields`), the one place that reads
+  `fields` on 0.16 and `field_names`/`field_types` on 0.17. Generated structs use `@Struct`.
+- **Timed condition waits use `src/timed_condition.zig`** until 0.17's
+  `Io.Condition.waitTimeout`; everything else uses `Io.Condition` directly.
+
 ## The boundary is the product
 
 `zigstore` knows nothing about any consumer's records, hierarchy, slugs, or statuses. The
@@ -40,7 +57,7 @@ one unforgivable regression is a dependency cycle back to a consumer.
 
 A change is done only when the gate passes and you have cited the evidence.
 
-- **`zig build test`** (exit 0) on pinned **Zig 0.15.2**.
+- **`zig build test`** (exit 0) on pinned **Zig 0.16.0**.
 - **`zig build -Dcpu=baseline`** must compile (the OKE Ampere A1 target).
 - The on-disk WAL/file path needs Linux `O_DIRECT`/`fallocate`, so the full gate runs in the
   **Linux devcontainer**, not the macOS host. The in-memory surface builds and tests on the

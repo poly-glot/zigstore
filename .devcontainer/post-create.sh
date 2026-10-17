@@ -8,10 +8,10 @@ sudo apt-get install -y -qq --no-install-recommends \
   curl wget jq xz-utils unzip
 
 # Pinned Zig — the engine's gate runs on this exact version (see build.zig.zon).
-# ZLS is coupled to Zig by minor version, so pin it to the 0.15.x line and bump the two
+# ZLS is coupled to Zig by minor version, so pin it to the 0.16.x line and bump the two
 # together. A floating `latest` tag pulls a newer ZLS that refuses to run against this Zig.
-ZIG_VERSION="0.15.2"
-ZLS_VERSION="0.15.0"
+ZIG_VERSION="0.16.0"
+ZLS_VERSION="0.16.0"
 ZIG_ARCH="$(uname -m)"
 if [ "$ZIG_ARCH" = "x86_64" ]; then
   ZIG_TARGET="x86_64-linux"

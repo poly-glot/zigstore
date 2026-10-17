@@ -12,11 +12,11 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
 
 jobs:
   test:
-    name: zig build test (0.15.2, ${{ matrix.arch }})
+    name: zig build test (0.16.0, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

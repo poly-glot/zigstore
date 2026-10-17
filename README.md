@@ -41,7 +41,7 @@ From that one declaration the engine generates, at comptime:
 
 ## Status
 
-A complete embeddable **and** networked record store, validated on **Zig 0.15.2** (211 tests
+A complete embeddable **and** networked record store, validated on **Zig 0.16.0** (215 tests
 plus a `-Dcpu=baseline` build). Every layer is implemented:
 
 | Surface | State |
@@ -91,7 +91,7 @@ zig fetch --save "https://github.com/poly-glot/zigstore/archive/refs/tags/v1.1.0
 
 ```zig
 const Store = zigstore.Engine(schema);
-const store = try Store.init(allocator, .{ .data_dir = dir });   // heap-stable *Store
+const store = try Store.init(io, allocator, .{ .data_dir = dir });   // heap-stable *Store
 defer store.deinit();
 
 const tree = store.tree("links_by_id");           // *BPlusTree, name checked at comptime
@@ -113,6 +113,17 @@ _ = try store.checkpoint();                       // drain + write pages/header 
 The dynamic seams stay runtime callbacks the consumer supplies: `store.recover(ctx, .{ .apply_entry, .on_replayed, .bootstrap })`, `store.spawnWorker(ctx, .{ .interval_ns, .tick })`, `zigstore.commit(Record, store, op_code, record, ctx, serialize_fn, apply_fn)`, snapshot over a `SnapshotHost`, health/readiness facts via `store.healthStatus()`, replication over `store.primaryHost()` / `store.replicaHost(ctx, apply_entry)` (`zigstore.replication.Hub.start` on the leader, `Receiver.start` on a standby — see [`docs/design/replication-streaming-standby.md`](docs/design/replication-streaming-standby.md)), `zigstore.protocol.processFrames(ctx, conn, dispatch_fn, op_latency, response_reserve)`, and `zigstore.run(Store, ctx, handler, config)`.
 
 See [`examples/basic.zig`](examples/basic.zig) for a full directory-shaped store driven end to end.
+
+### `std.Io`
+
+Every public constructor takes a `std.Io` first (`Store.init`, `ShardSet.init`, `WalWriter.init`,
+`PageCache.init`, `Hub.start`, `Receiver.start`, `fetchBaseBackup`, `SnapshotManager`) and
+`ServerConfig.fromEnv` reads a `*const std.process.Environ.Map`; `main` gets both from
+`std.process.Init`, or builds a `std.Io.Threaded` (as `examples/basic.zig` does), and tests use
+`std.testing.io`. The `Io` runs the locks and the cold path (create, rename, copy, stat, the
+replay reader); the hot path — the `O_DIRECT` WAL, page I/O, the checkpoint journal, and the
+epoll reactor — stays on raw Linux syscalls (`src/sys.zig`) so the on-disk and wire formats are
+byte-identical to 2.x.
 
 ### Durability model
 
@@ -154,7 +165,7 @@ N independent `Store`s under one `data_dir`, each its own serialization domain, 
 
 ```zig
 const Set = zigstore.ShardSet(zigstore.Engine(schema));
-const set = try Set.init(allocator, .{ .data_dir = dir, .shard_count = 8 });
+const set = try Set.init(io, allocator, .{ .data_dir = dir, .shard_count = 8 });
 defer set.deinit();
 
 const key = codec.encodeU64(id);
@@ -178,7 +189,7 @@ zig build bench -- --no-direct --dir /dev/shm/zsb # buffered WAL on tmpfs: isola
 
 ## Develop
 
-The repo ships a devcontainer that pins Zig 0.15.2 and ZLS:
+The repo ships a devcontainer that pins Zig 0.16.0 and ZLS:
 
 ```bash
 zig build test            # engine + example tests
@@ -188,7 +199,7 @@ zig fmt --check src/ examples/ build.zig
 ```
 
 The paged storage uses Linux `O_DIRECT`/`fallocate`, so `zig build test` runs in the Linux
-devcontainer (or any Linux host with Zig 0.15.2); CI runs it on Zig 0.15.2 on both x86_64 and
+devcontainer (or any Linux host with Zig 0.16.0); CI runs it on Zig 0.16.0 on both x86_64 and
 arm64 (`ubuntu-24.04-arm`) plus a `-Dcpu=baseline` build.
 
 ## Versioning
