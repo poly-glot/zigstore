@@ -23,6 +23,7 @@ const wal = @import("wal.zig");
 const wal_replay = @import("wal_replay.zig");
 const snapshot = @import("snapshot.zig");
 const replication = @import("replication.zig");
+const commit = @import("commit.zig");
 
 /// The paged B+Tree backing one index (point ops + range scans over byte keys/values).
 pub const BPlusTree = @import("btree/btree.zig").BPlusTree;
@@ -261,9 +262,19 @@ pub const Worker = struct {
 ///
 /// The returned type exposes `Header` (the generated superblock), `Config`, `init`/`deinit`,
 /// per-index tree access via `tree(name)`, per-memtable access via `memtable(name)`,
-/// persisted-counter access via `counter(name)` / `nextId(name)`, durable `flushHeader`,
-/// memtable draining via `drainMemtables`, and the `recover`/`spawnWorker` runtime seams. Tree,
-/// memtable, and counter names are checked at comptime against the schema.
+/// persisted-counter access via `counter(name)` / `nextId(name)`, the atomic `checkpoint`
+/// (and its pressure valve `flushPages`), memtable draining via `drainMemtables`, and the
+/// `recover`/`spawnWorker`/`spawnCheckpointer` runtime seams. Tree, memtable, and counter
+/// names are checked at comptime against the schema.
+///
+/// Durability model: a WAL append is acknowledged after `fdatasync`; tree pages are written
+/// only by `checkpoint`/`flushPages` through `PageCache.checkpoint` (journal, then in place),
+/// never by eviction; `header.seq` records the WAL sequence up to which every entry is fully
+/// contained in the on-disk tree, and `checkpoint` truncates the WAL to that point.
+///
+/// Lock order, everywhere in the engine: `mt_drain_mutex` → `apply_mutex`. A consumer's
+/// `apply_fn`/`apply_entry` runs under `apply_mutex` and must therefore never call
+/// `drainMemtables`, `flushPages`, or `checkpoint`.
 pub fn Engine(comptime s: Schema) type {
     return struct {
         const Store = @This();
@@ -295,6 +306,7 @@ pub fn Engine(comptime s: Schema) type {
         allocator: std.mem.Allocator,
         config: Config,
         file: std.fs.File,
+        journal: std.fs.File,
         header: Header,
         cache: page_cache.PageCache,
         free_list: freelist.FreeList,
@@ -319,14 +331,21 @@ pub fn Engine(comptime s: Schema) type {
         commit_gate: std.atomic.Value(?*replication.CommitGate),
         sync_gate: replication.CommitGate,
 
+        checkpoint_interval_s: u32,
+        last_checkpoint_time: i64,
+
         /// Open (or create) the store under `config.data_dir`, returning a heap-allocated
-        /// `*Store` at a stable address. On a fresh directory the header is formatted with the
-        /// schema's identity and every index starts at an empty (lazily-allocated) root; on an
-        /// existing one the header is loaded and validated and each tree is wired to the shared
-        /// cache/free list at its persisted root and count. The store owns its own allocation:
-        /// every tree's `cache`/`free_list` and the free list's `cache` are bound to the settled
-        /// in-place pointers and the WAL flusher is started before returning, so the value never
-        /// needs an external rebind. Release it with `deinit`.
+        /// `*Store` at a stable address. A complete `checkpoint.journal` left by a crash is
+        /// redone into `store.dat` first (an incomplete one is discarded); the journal then
+        /// stays open, empty, for the store's checkpoints. On a fresh directory
+        /// the header is formatted with the schema's identity and every index starts at an
+        /// empty (lazily-allocated) root; on an existing one the header is loaded and validated
+        /// and each tree is wired to the shared cache/free list at its persisted root and count.
+        /// The WAL must open: a WAL that cannot be opened or scanned (including
+        /// `error.WalCorrupt`) fails `init`. The store owns its own allocation: every tree's
+        /// `cache`/`free_list` and the free list's `cache` are bound to the settled in-place
+        /// pointers and the WAL flusher is started before returning, so the value never needs
+        /// an external rebind. Release it with `deinit`.
         pub fn init(allocator: std.mem.Allocator, config: Config) !*Store {
             std.fs.makeDirAbsolute(config.data_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
@@ -338,6 +357,9 @@ pub fn Engine(comptime s: Schema) type {
 
             const file = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = false });
             errdefer file.close();
+
+            const journal = try openJournal(allocator, config.data_dir, file);
+            errdefer journal.close();
 
             const file_size = (try file.stat()).size;
             const is_new = file_size == 0;
@@ -374,10 +396,8 @@ pub fn Engine(comptime s: Schema) type {
                 log.warn("snapshot meta read failed: {} — WAL sequence resumes from 0", .{err});
                 break :blk 0;
             };
-            var wal_writer = wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, snapshot_base, config.wal_direct_io) catch |err| blk: {
-                log.warn("WAL open failed: {} — continuing without WAL", .{err});
-                break :blk null;
-            };
+            const wal_base = @max(header.seq, snapshot_base);
+            var wal_writer: ?wal.WalWriter = try wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, wal_base, config.wal_direct_io);
             errdefer if (wal_writer) |*w| w.deinit();
 
             const self = try allocator.create(Store);
@@ -387,6 +407,7 @@ pub fn Engine(comptime s: Schema) type {
                 .allocator = allocator,
                 .config = config,
                 .file = file,
+                .journal = journal,
                 .header = header,
                 .cache = cache,
                 .free_list = .{ .head = @intCast(header.free_list_head), .cache = undefined, .mutex = .{} },
@@ -404,6 +425,8 @@ pub fn Engine(comptime s: Schema) type {
                 .replica_streaming = std.atomic.Value(bool).init(false),
                 .commit_gate = std.atomic.Value(?*replication.CommitGate).init(null),
                 .sync_gate = .{},
+                .checkpoint_interval_s = 0,
+                .last_checkpoint_time = 0,
             };
 
             inline for (s.indexes) |idx| {
@@ -436,19 +459,13 @@ pub fn Engine(comptime s: Schema) type {
             return self;
         }
 
-        /// Tear down the store the `init` heap-allocated: drain memtables, flush dirty pages and
-        /// the header, close the WAL and data file, free every owned resource, and finally
-        /// `destroy` the store allocation itself. Call once on the `*Store` returned by `init`;
-        /// the pointer is invalid afterward.
+        /// Tear down the store the `init` heap-allocated: take a final `checkpoint`, close the
+        /// WAL and data file, free every owned resource, and finally `destroy` the store
+        /// allocation itself. Stop every worker first. Call once on the `*Store` returned by
+        /// `init`; the pointer is invalid afterward.
         pub fn deinit(self: *Store) void {
-            self.drainMemtables() catch |err| {
-                log.err("deinit drain failed: {}", .{err});
-            };
-            self.cache.flushAll() catch |err| {
-                log.err("deinit cache flush failed: {}", .{err});
-            };
-            self.flushHeader() catch |err| {
-                log.err("deinit header flush failed: {}", .{err});
+            _ = self.checkpoint() catch |err| {
+                log.err("deinit checkpoint failed: {}", .{err});
             };
 
             if (self.wal_writer) |*w| w.deinit();
@@ -457,6 +474,7 @@ pub fn Engine(comptime s: Schema) type {
                 @field(self.memtables, name).deinit();
             }
             self.cache.deinit();
+            self.journal.close();
             self.file.close();
 
             const allocator = self.allocator;
@@ -479,7 +497,8 @@ pub fn Engine(comptime s: Schema) type {
         /// A pointer to the named counter's persisted slot in the header. Single-writer:
         /// the caller serializes all counter mutations; this raw header field is written
         /// non-atomically and must not be touched concurrently with another counter
-        /// mutation or with `flushHeader` (which reads the header under `header_lock`).
+        /// mutation or with `checkpoint`/`flushPages` (which read the header under
+        /// `header_lock`).
         pub fn counter(self: *Store, comptime name: [:0]const u8) *u64 {
             comptime assertCounter(name);
             return &@field(self.header, name);
@@ -488,7 +507,7 @@ pub fn Engine(comptime s: Schema) type {
         /// Increment the named counter and return its new value. Allocates ids from `1`.
         /// Single-writer / caller-serialized: the read-modify-write is non-atomic, so the
         /// caller must not call it concurrently with another counter mutation or with
-        /// `flushHeader`.
+        /// `checkpoint`/`flushPages`.
         pub fn nextId(self: *Store, comptime name: [:0]const u8) u64 {
             const slot = self.counter(name);
             slot.* += 1;
@@ -496,24 +515,34 @@ pub fn Engine(comptime s: Schema) type {
         }
 
         /// Drain every write memtable into its backing B+Tree: tombstones delete, live entries
-        /// insert, applied in shard order. Serialized against concurrent drains.
+        /// insert, applied in shard order. Serialized against concurrent drains. When the page
+        /// cache's dirty pressure is high mid-drain, the pages are flushed (`flushPages`) between
+        /// two inserts so a large drain can never exhaust the no-steal cache. A drain that fails
+        /// midway leaves the undrained rows in the memtable's back buffer; the next drain merges
+        /// and retries them.
         pub fn drainMemtables(self: *Store) !void {
             self.mt_drain_mutex.lock();
             defer self.mt_drain_mutex.unlock();
+            try self.drainMemtablesLocked(false);
+        }
+
+        fn drainMemtablesLocked(self: *Store, apply_held: bool) !void {
             inline for (s.memtable_indexes) |name| {
-                try drainOne(&@field(self.memtables, name), &@field(self.trees, name));
+                try self.drainOne(&@field(self.memtables, name), &@field(self.trees, name), apply_held);
             }
         }
 
-        fn drainOne(mt: *MemTable, dst: *BPlusTree) !void {
+        fn drainOne(self: *Store, mt: *MemTable, dst: *BPlusTree, apply_held: bool) !void {
             mt.lockAll();
             var backs: [MEMTABLE_SHARDS]*MemTable.Buffer = undefined;
-            for (0..MEMTABLE_SHARDS) |i| backs[i] = mt.swapShardLocked(i);
+            const swapped = swapAllShards(mt, &backs);
             mt.unlockAll();
+            try swapped;
 
             for (0..MEMTABLE_SHARDS) |i| {
                 var it = backs[i].map.iterator();
                 while (it.next()) |entry| {
+                    try self.relieveDrainPressure(apply_held);
                     const key = entry.key_ptr.*;
                     const val = entry.value_ptr.*;
                     if (val.tombstone) {
@@ -529,9 +558,95 @@ pub fn Engine(comptime s: Schema) type {
             mt.unlockAll();
         }
 
-        /// Sync every tree's live root/count and the persisted counters into the header, then
-        /// write the superblock to page 0 and fsync. Serialized by the header lock.
-        pub fn flushHeader(self: *Store) !void {
+        fn swapAllShards(mt: *MemTable, backs: *[MEMTABLE_SHARDS]*MemTable.Buffer) !void {
+            for (0..MEMTABLE_SHARDS) |i| backs[i] = try mt.swapShardLocked(i);
+        }
+
+        fn relieveDrainPressure(self: *Store, apply_held: bool) !void {
+            if (!self.cache.dirtyPressureHigh()) return;
+            if (!apply_held) self.apply_mutex.lock();
+            defer if (!apply_held) self.apply_mutex.unlock();
+            try self.persistLocked(self.header.seq);
+        }
+
+        /// Write every dirty page and the header to `store.dat` atomically (journal, then in
+        /// place) without draining memtables or claiming new WAL entries durable-in-tree:
+        /// `header.seq` is unchanged. The pressure valve a `spawnCheckpointer` worker pulls when
+        /// `cache.dirtyPressureHigh()`; takes `mt_drain_mutex` then `apply_mutex`.
+        pub fn flushPages(self: *Store) !void {
+            self.mt_drain_mutex.lock();
+            defer self.mt_drain_mutex.unlock();
+            self.apply_mutex.lock();
+            defer self.apply_mutex.unlock();
+            try self.persistLocked(self.header.seq);
+        }
+
+        /// `flushPages` only when `cache.dirtyPressureHigh()`, re-checked under the locks so a
+        /// thundering herd of callers flushes once. Safe to call from any thread holding no
+        /// engine lock; the commit path calls it before appending.
+        pub fn relieveDirtyPressure(self: *Store) !void {
+            if (!self.cache.dirtyPressureHigh()) return;
+            self.mt_drain_mutex.lock();
+            defer self.mt_drain_mutex.unlock();
+            try self.relieveDrainPressure(false);
+        }
+
+        /// Make everything committed so far durable in the tree, atomically with respect to a
+        /// crash, and return the new `header.seq`. Takes `mt_drain_mutex` then `apply_mutex` and
+        /// runs `checkpointLocked`.
+        pub fn checkpoint(self: *Store) !u64 {
+            self.mt_drain_mutex.lock();
+            defer self.mt_drain_mutex.unlock();
+            self.apply_mutex.lock();
+            defer self.apply_mutex.unlock();
+            return self.checkpointLocked();
+        }
+
+        /// The checkpoint body; the caller holds `mt_drain_mutex` and `apply_mutex`. Pauses WAL
+        /// appends and waits until every appended entry has applied, flushes pages first if the
+        /// cache is under pressure, drains every memtable into its tree, writes every dirty page
+        /// and the header (with `header.seq` = the WAL sequence) through the checkpoint journal,
+        /// then truncates the WAL (unless a replica still retains it). Returns the durable
+        /// sequence. The `SnapshotHost` seam calls this.
+        pub fn checkpointLocked(self: *Store) !u64 {
+            if (self.wal_writer) |*w| {
+                w.pauseAppends();
+                defer w.resumeAppends();
+                return self.checkpointQuiesced(w);
+            }
+            return self.checkpointQuiesced(null);
+        }
+
+        fn checkpointQuiesced(self: *Store, w: ?*wal.WalWriter) !u64 {
+            if (w) |writer| {
+                while (self.last_applied_seq < writer.getSequence()) {
+                    self.apply_cond.wait(&self.apply_mutex);
+                }
+            }
+
+            if (self.cache.dirtyPressureHigh()) try self.persistLocked(self.header.seq);
+            try self.drainMemtablesLocked(true);
+
+            const durable: u64 = if (w) |writer| writer.getSequence() else self.header.seq;
+            try self.persistLocked(durable);
+
+            if (w) |writer| writer.truncateAfterCheckpoint() catch |err| switch (err) {
+                error.WalRetainedByReplica => {},
+                else => return err,
+            };
+            return durable;
+        }
+
+        fn persistLocked(self: *Store, durable_seq: u64) !void {
+            const previous_seq = self.header.seq;
+            errdefer self.header.seq = previous_seq;
+            const header_bytes = self.serializeHeaderLocked(durable_seq);
+
+            try self.cache.checkpoint(self.journal, &header_bytes);
+            try self.journal.setEndPos(0);
+        }
+
+        fn serializeHeaderLocked(self: *Store, durable_seq: u64) [page.PAGE_SIZE]u8 {
             self.header_lock.lock();
             defer self.header_lock.unlock();
 
@@ -543,37 +658,81 @@ pub fn Engine(comptime s: Schema) type {
             self.cache.alloc_lock.lock();
             self.header.page_count = self.cache.page_count;
             self.cache.alloc_lock.unlock();
+            self.header.seq = durable_seq;
 
-            const header_bytes = file_header.serialize(self.header);
-            try self.file.seekTo(0);
-            try self.file.writeAll(&header_bytes);
-            try self.file.sync();
+            return file_header.serialize(self.header);
         }
 
-        /// Replay the WAL, drain, flush, and bootstrap — the engine owns the ordering, the
-        /// caller owns the per-entry semantics. For each decoded entry past the checkpoint,
-        /// `apply_entry(ctx, entry)` runs; then memtables drain and the header is flushed;
-        /// then `on_replayed(ctx)` runs; and if the store opened empty, `bootstrap(ctx)` runs.
-        /// The engine imports no application module — decoding and applying an entry lives
-        /// entirely inside `apply_entry`.
+        fn journalPath(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+            return std.fs.path.join(allocator, &.{ data_dir, "checkpoint.journal" });
+        }
+
+        fn openJournal(allocator: std.mem.Allocator, data_dir: []const u8, file: std.fs.File) !std.fs.File {
+            const journal_path = try journalPath(allocator, data_dir);
+            defer allocator.free(journal_path);
+
+            const journal = std.fs.openFileAbsolute(journal_path, .{ .mode = .read_write }) catch |err| switch (err) {
+                error.FileNotFound => {
+                    const created = try std.fs.createFileAbsolute(journal_path, .{ .read = true });
+                    snapshot.fsyncDir(data_dir);
+                    return created;
+                },
+                else => return err,
+            };
+            errdefer journal.close();
+
+            if ((try journal.getEndPos()) > 0) {
+                if (try page_cache.PageCache.redoJournal(journal, file)) {
+                    log.info("open: redid the checkpoint journal left by an interrupted checkpoint", .{});
+                } else {
+                    log.warn("open: discarded an incomplete checkpoint journal", .{});
+                }
+                try journal.setEndPos(0);
+                try journal.sync();
+            }
+            return journal;
+        }
+
+        /// Spawn the background checkpointer: a `Worker` ticking every second that pulls the
+        /// pressure valve (`flushPages`) whenever `cache.dirtyPressureHigh()` and runs a full
+        /// `checkpoint` every `interval_s` seconds. Tick errors are logged by the worker and the
+        /// next tick retries. Stop it with `worker.stop()` before `deinit`.
+        pub fn spawnCheckpointer(self: *Store, interval_s: u32) !*Worker {
+            self.checkpoint_interval_s = interval_s;
+            self.last_checkpoint_time = std.time.timestamp();
+            return self.spawnWorker(self, .{ .interval_ns = std.time.ns_per_s, .tick = checkpointerTick });
+        }
+
+        fn checkpointerTick(ctx: *anyopaque) anyerror!void {
+            const self: *Store = @ptrCast(@alignCast(ctx));
+            try self.relieveDirtyPressure();
+
+            const now = std.time.timestamp();
+            if (now - self.last_checkpoint_time < @as(i64, self.checkpoint_interval_s)) return;
+            _ = try self.checkpoint();
+            self.last_checkpoint_time = now;
+        }
+
+        /// Replay the WAL, checkpoint, and bootstrap — the engine owns the ordering, the caller
+        /// owns the per-entry semantics. For each decoded entry with a sequence above
+        /// `header.seq` (entries at or below it are already in the on-disk tree),
+        /// `apply_entry(ctx, entry)` runs, with the pressure valve pulled between entries; then,
+        /// if anything was in the WAL, a full `checkpoint` lands it in the tree and truncates
+        /// the WAL; then `on_replayed(ctx)` runs; and if the store opened empty, `bootstrap(ctx)`
+        /// runs. A failed checkpoint fails recovery. The engine imports no application module —
+        /// decoding and applying an entry lives entirely inside `apply_entry`.
         pub fn recover(self: *Store, ctx: *anyopaque, hooks: struct {
             apply_entry: *const fn (ctx: *anyopaque, entry: ReplayEntry) anyerror!void,
             on_replayed: *const fn (ctx: *anyopaque) anyerror!void,
             bootstrap: *const fn (ctx: *anyopaque) anyerror!void,
         }) !void {
-            var applier = ReplayAdapter{ .ctx = ctx, .apply_entry = hooks.apply_entry };
-            const last_seq = wal_replay.replayWal(self.config.data_dir, 0, &applier) catch |err| {
+            var applier = ReplayAdapter{ .store = self, .ctx = ctx, .apply_entry = hooks.apply_entry };
+            const last_seq = wal_replay.replayWal(self.config.data_dir, self.header.seq, &applier) catch |err| {
                 log.err("WAL replay failed: {}", .{err});
                 return err;
             };
 
-            if (last_seq > 0) {
-                try self.drainMemtables();
-                self.cache.flushAll() catch |err| {
-                    log.err("recover cache flush failed: {}", .{err});
-                };
-                try self.flushHeader();
-            }
+            if (last_seq > 0) _ = try self.checkpoint();
 
             try hooks.on_replayed(ctx);
 
@@ -581,11 +740,13 @@ pub fn Engine(comptime s: Schema) type {
         }
 
         const ReplayAdapter = struct {
+            store: *Store,
             ctx: *anyopaque,
             apply_entry: *const fn (ctx: *anyopaque, entry: ReplayEntry) anyerror!void,
 
             pub fn apply(self: *ReplayAdapter, entry: ReplayEntry) !void {
                 try self.apply_entry(self.ctx, entry);
+                try self.store.relieveDirtyPressure();
             }
         };
 
@@ -612,18 +773,16 @@ pub fn Engine(comptime s: Schema) type {
         }
 
         /// The `snapshot.SnapshotHost` view of this store: the in-progress guard, the data
-        /// directory, the apply and drain locks, and the four function pointers the generic
-        /// snapshot routine drives (WAL sequence, cache flush, header flush, page count). Pass
-        /// the result to `snapshot.forceSnapshot`.
+        /// directory, the drain and apply locks, and the two function pointers the generic
+        /// snapshot routine drives (`checkpointLocked`, page count). Pass the result to
+        /// `snapshot.forceSnapshot`.
         pub fn snapshotHost(self: *Store) snapshot.SnapshotHost {
             return .{
                 .snapshot_in_progress = &self.snapshot_in_progress,
                 .data_dir = self.config.data_dir,
                 .apply_mutex = &self.apply_mutex,
                 .mt_drain_mutex = &self.mt_drain_mutex,
-                .walSequence = snapshotWalSequence,
-                .flushCache = snapshotFlushCache,
-                .flushHeader = snapshotFlushHeader,
+                .checkpointLocked = snapshotCheckpointLocked,
                 .pageCount = snapshotPageCount,
                 .ctx = self,
             };
@@ -749,9 +908,9 @@ pub fn Engine(comptime s: Schema) type {
         }
 
         /// The `replication.ReplicaHost` view of this store for `Receiver.start`: the WAL
-        /// writer, the apply-ordering state, the read-only flag, and the consumer's
-        /// `apply_entry` hook (same shape as `recover`'s). Fails with `error.WalDisabled`
-        /// when the store opened without a WAL.
+        /// writer, the apply-ordering state, the read-only flag, the page-cache pressure valve,
+        /// and the consumer's `apply_entry` hook (same shape as `recover`'s). Fails with
+        /// `error.WalDisabled` when the store opened without a WAL.
         pub fn replicaHost(
             self: *Store,
             ctx: *anyopaque,
@@ -765,24 +924,21 @@ pub fn Engine(comptime s: Schema) type {
                 .last_applied_seq = &self.last_applied_seq,
                 .read_only = &self.read_only,
                 .streaming = &self.replica_streaming,
+                .store_ctx = self,
+                .relieve_pressure = replicaRelievePressure,
                 .ctx = ctx,
                 .apply_entry = apply_entry,
             };
         }
 
-        fn snapshotWalSequence(ctx: *anyopaque) u64 {
-            const self: *Store = @ptrCast(@alignCast(ctx));
-            return if (self.wal_writer) |*w| w.getSequence() else 0;
+        fn replicaRelievePressure(store_ctx: *anyopaque) anyerror!void {
+            const self: *Store = @ptrCast(@alignCast(store_ctx));
+            try self.relieveDirtyPressure();
         }
 
-        fn snapshotFlushCache(ctx: *anyopaque) anyerror!void {
+        fn snapshotCheckpointLocked(ctx: *anyopaque) anyerror!u64 {
             const self: *Store = @ptrCast(@alignCast(ctx));
-            try self.cache.flushAll();
-        }
-
-        fn snapshotFlushHeader(ctx: *anyopaque) anyerror!void {
-            const self: *Store = @ptrCast(@alignCast(ctx));
-            try self.flushHeader();
+            return self.checkpointLocked();
         }
 
         fn snapshotPageCount(ctx: *anyopaque) u64 {
@@ -831,12 +987,83 @@ fn openTestStore(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !*TestS
     return TestStore.init(allocator, .{ .data_dir = path, .cache_size_mb = 16 });
 }
 
+fn openTestStoreSized(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, cache_size_mb: u32) !*TestStore {
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    errdefer allocator.free(path);
+    return TestStore.init(allocator, .{ .data_dir = path, .cache_size_mb = cache_size_mb });
+}
+
 fn closeTestStore(store: *TestStore) void {
     const allocator = store.allocator;
     const data_dir = store.config.data_dir;
     store.deinit();
     allocator.free(data_dir);
 }
+
+fn crashClose(store: *TestStore) void {
+    const allocator = store.allocator;
+    const data_dir = store.config.data_dir;
+    if (store.wal_writer) |*w| w.deinit();
+    inline for (test_schema.memtable_indexes) |name| store.memtable(name).deinit();
+    store.cache.deinit();
+    store.journal.close();
+    store.file.close();
+    allocator.destroy(store);
+    allocator.free(data_dir);
+}
+
+const TestRecord = struct { id: u64, value: []const u8 = "v" };
+
+fn serializeTestRecord(allocator: std.mem.Allocator, rec: TestRecord) anyerror![]u8 {
+    const buf = try allocator.alloc(u8, 8 + rec.value.len);
+    std.mem.writeInt(u64, buf[0..8], rec.id, .big);
+    @memcpy(buf[8..], rec.value);
+    return buf;
+}
+
+fn applyTestRecord(ctx: *anyopaque, rec: TestRecord) anyerror!void {
+    const store: *TestStore = @ptrCast(@alignCast(ctx));
+    try store.tree("by_id").insert(&codec.encodeU64(rec.id), rec.value);
+}
+
+fn replayTestRecord(ctx: *anyopaque, entry: ReplayEntry) anyerror!void {
+    const store: *TestStore = @ptrCast(@alignCast(ctx));
+    try store.tree("by_id").insert(entry.data[0..8], entry.data[8..]);
+}
+
+fn commitKey(store: *TestStore, id: u64) !u64 {
+    return commit.commitSeq(TestRecord, store, 1, .{ .id = id }, store, serializeTestRecord, applyTestRecord, .{});
+}
+
+fn commitKeyUnawaited(store: *TestStore, id: u64, value: []const u8) !void {
+    var completion = commit.CommitCompletion{};
+    _ = try commit.commitSeq(TestRecord, store, 1, .{ .id = id, .value = value }, store, serializeTestRecord, applyTestRecord, .{ .completion = &completion });
+}
+
+fn expectKeyPresent(store: *TestStore, id: u64, present: bool) !void {
+    var buf: [1024]u8 = undefined;
+    const found = try store.tree("by_id").search(&codec.encodeU64(id), &buf);
+    try std.testing.expectEqual(present, found != null);
+}
+
+fn walIsEmpty(dir: []const u8) !bool {
+    var applier = CountingApplier{};
+    const last = try wal_replay.replayWal(dir, 0, &applier);
+    return last == 0 and applier.count == 0;
+}
+
+fn noopHook(ctx: *anyopaque) anyerror!void {
+    _ = ctx;
+}
+
+const CountingApplier = struct {
+    count: usize = 0,
+
+    pub fn apply(self: *CountingApplier, entry: ReplayEntry) !void {
+        _ = entry;
+        self.count += 1;
+    }
+};
 
 test "Header carries magic, generic slots, a root/count per index, and is PAGE_SIZE" {
     try std.testing.expect(@hasField(TestStore.Header, "magic"));
@@ -848,7 +1075,7 @@ test "Header carries magic, generic slots, a root/count per index, and is PAGE_S
     try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), @sizeOf(TestStore.Header));
 }
 
-test "paged store: insert, flushHeader, reopen, search round-trips through page 0" {
+test "paged store: insert, checkpoint, reopen, search round-trips through page 0" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -861,7 +1088,7 @@ test "paged store: insert, flushHeader, reopen, search round-trips through page 
         try std.testing.expectEqual(@as(u64, 1), id);
 
         try store.tree("by_id").insert(&codec.encodeU64(id), "hello");
-        try store.flushHeader();
+        _ = try store.checkpoint();
     }
 
     {
@@ -878,7 +1105,7 @@ test "paged store: insert, flushHeader, reopen, search round-trips through page 
     }
 }
 
-test "paged store: a split (moved) root survives flushHeader, reopen, and search" {
+test "paged store: a split (moved) root survives checkpoint, reopen, and search" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -900,7 +1127,7 @@ test "paged store: a split (moved) root survives flushHeader, reopen, and search
         try std.testing.expect(moved);
 
         entry_count = store.tree("by_id").entryCount();
-        try store.flushHeader();
+        _ = try store.checkpoint();
     }
 
     {
@@ -946,7 +1173,7 @@ test "counters persist in the header and allocate from 1" {
         try std.testing.expectEqual(@as(u64, 1), store.nextId("next_id"));
         try std.testing.expectEqual(@as(u64, 2), store.nextId("next_id"));
         store.counter("next_seq").* = 99;
-        try store.flushHeader();
+        _ = try store.checkpoint();
     }
 
     {
@@ -1066,14 +1293,13 @@ test "reopen resumes the WAL sequence from snapshot metadata after truncation" {
         const store = try openTestStore(allocator, &tmp);
         defer closeTestStore(store);
 
-        const w = &store.wal_writer.?;
-        _ = try w.append(1, "a");
-        _ = try w.append(1, "b");
-        _ = try w.append(1, "c");
-        try w.sync();
+        _ = try commitKey(store, 1);
+        _ = try commitKey(store, 2);
+        _ = try commitKey(store, 3);
 
-        _ = try snapshot.forceSnapshot(store.snapshotHost());
-        try w.truncateAfterCheckpoint();
+        const result = try snapshot.forceSnapshot(store.snapshotHost());
+        try std.testing.expectEqual(@as(u64, 3), result.wal_sequence);
+        try std.testing.expect(try walIsEmpty(store.config.data_dir));
     }
 
     {
@@ -1096,13 +1322,312 @@ test "healthStatus reports the read-only flag and applied/durable LSNs" {
     try std.testing.expectEqual(@as(u64, 0), fresh.last_applied_lsn);
     try std.testing.expectEqual(@as(u64, 0), fresh.durable_lsn);
 
-    const w = &store.wal_writer.?;
-    _ = try w.append(1, "a");
-    _ = try w.append(1, "b");
-    try w.sync();
+    _ = try commitKey(store, 1);
+    _ = try commitKey(store, 2);
 
     store.demote();
     const demoted = store.healthStatus();
     try std.testing.expect(demoted.read_only);
     try std.testing.expectEqual(@as(u64, 2), demoted.durable_lsn);
+    try std.testing.expectEqual(@as(u64, 2), demoted.last_applied_lsn);
+}
+
+test "header layout is byte-stable" {
+    const Header = TestStore.Header;
+    try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), @sizeOf(Header));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Header, "magic"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(Header, "format_version"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(Header, "page_size"));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(Header, "_pad"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Header, "free_list_head"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(Header, "page_count"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(Header, "seq"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(Header, "by_id_root"));
+    try std.testing.expectEqual(comptime headerPrefixSize(test_schema), @offsetOf(Header, "_reserved"));
+}
+
+test "crash after a root split and before a checkpoint still finds every pre-split key" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pre_split: u64 = 100;
+    var last_inserted: u64 = pre_split;
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        var i: u64 = 1;
+        while (i <= pre_split) : (i += 1) try store.tree("by_id").insert(&codec.encodeU64(i), "v");
+        _ = try store.checkpoint();
+
+        const initial_root = store.tree("by_id").getRootPage();
+        while (store.tree("by_id").getRootPage() == initial_root) {
+            last_inserted += 1;
+            try store.tree("by_id").insert(&codec.encodeU64(last_inserted), "v");
+        }
+        crashClose(store);
+    }
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        var i: u64 = 1;
+        while (i <= pre_split) : (i += 1) try expectKeyPresent(store, i, true);
+        try expectKeyPresent(store, last_inserted, false);
+        try std.testing.expectEqual(pre_split, store.tree("by_id").entryCount());
+    }
+}
+
+test "a checkpoint interrupted after its journal is durable completes on reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first_batch: u64 = 50;
+    const total: u64 = 100;
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        var i: u64 = 1;
+        while (i <= first_batch) : (i += 1) _ = try commitKey(store, i);
+        try std.testing.expectEqual(first_batch, try store.checkpoint());
+
+        var pre_checkpoint_header: [page.PAGE_SIZE]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), try store.file.preadAll(&pre_checkpoint_header, 0));
+
+        while (i <= total) : (i += 1) _ = try commitKey(store, i);
+
+        const header_bytes = store.serializeHeaderLocked(store.wal_writer.?.getSequence());
+        try store.cache.checkpoint(store.journal, &header_bytes);
+
+        try store.file.pwriteAll(&pre_checkpoint_header, 0);
+        try store.file.sync();
+        crashClose(store);
+    }
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        try std.testing.expectEqual(total, store.header.seq);
+        var i: u64 = 1;
+        while (i <= total) : (i += 1) try expectKeyPresent(store, i, true);
+        try std.testing.expectEqual(@as(u64, 0), try store.journal.getEndPos());
+    }
+}
+
+const ConcurrentCommitter = struct {
+    store: *TestStore,
+    base: u64,
+    count: u64,
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *ConcurrentCommitter) void {
+        var i: u64 = 0;
+        while (i < self.count) : (i += 1) {
+            _ = commitKey(self.store, self.base + i) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+        }
+    }
+};
+
+const CheckpointLooper = struct {
+    store: *TestStore,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    checkpoints: u64 = 0,
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *CheckpointLooper) void {
+        while (!self.stop.load(.acquire)) {
+            _ = self.store.checkpoint() catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.checkpoints += 1;
+        }
+    }
+};
+
+test "every committed key survives a crash during concurrent checkpoints" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const per_thread: u64 = 500;
+    const bases = [_]u64{ 0, 10_000, 20_000, 30_000 };
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+
+        var committers: [bases.len]ConcurrentCommitter = undefined;
+        for (&committers, bases) |*c, base| c.* = .{ .store = store, .base = base, .count = per_thread };
+        var looper = CheckpointLooper{ .store = store };
+
+        const looper_thread = try std.Thread.spawn(.{}, CheckpointLooper.run, .{&looper});
+        var threads: [bases.len]std.Thread = undefined;
+        for (&threads, &committers) |*t, *c| t.* = try std.Thread.spawn(.{}, ConcurrentCommitter.run, .{c});
+        for (threads) |t| t.join();
+        looper.stop.store(true, .release);
+        looper_thread.join();
+
+        for (committers) |c| try std.testing.expect(!c.failed.load(.acquire));
+        try std.testing.expect(!looper.failed.load(.acquire));
+        try std.testing.expect(looper.checkpoints >= 1);
+        crashClose(store);
+    }
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+
+        try store.recover(store, .{
+            .apply_entry = replayTestRecord,
+            .on_replayed = noopHook,
+            .bootstrap = noopHook,
+        });
+
+        for (bases) |base| {
+            var i: u64 = 0;
+            while (i < per_thread) : (i += 1) try expectKeyPresent(store, base + i, true);
+        }
+        try std.testing.expectEqual(bases.len * per_thread, store.tree("by_id").entryCount());
+    }
+}
+
+test "recovery with a page cache smaller than the replayed data succeeds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const total: u64 = 20_000;
+    const value = [_]u8{'x'} ** 512;
+
+    {
+        const store = try openTestStoreSized(allocator, &tmp, 8);
+        var i: u64 = 1;
+        while (i <= total) : (i += 1) try commitKeyUnawaited(store, i, &value);
+        try store.wal_writer.?.sync();
+        crashClose(store);
+    }
+
+    {
+        const store = try openTestStoreSized(allocator, &tmp, 8);
+        defer closeTestStore(store);
+
+        try store.recover(store, .{
+            .apply_entry = replayTestRecord,
+            .on_replayed = noopHook,
+            .bootstrap = noopHook,
+        });
+
+        try std.testing.expectEqual(total, store.header.seq);
+        try std.testing.expect(try walIsEmpty(store.config.data_dir));
+        var i: u64 = 1;
+        while (i <= total) : (i += 997) try expectKeyPresent(store, i, true);
+        try expectKeyPresent(store, total, true);
+        try expectKeyPresent(store, total + 1, false);
+    }
+}
+
+test "the WAL sequence resumes from header.seq after a checkpoint even without snapshot.meta" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+        _ = try commitKey(store, 1);
+        _ = try commitKey(store, 2);
+        _ = try commitKey(store, 3);
+        try std.testing.expectEqual(@as(u64, 3), try store.checkpoint());
+        try std.testing.expect(try walIsEmpty(store.config.data_dir));
+    }
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("snapshot.meta", .{}));
+
+    {
+        const store = try openTestStore(allocator, &tmp);
+        defer closeTestStore(store);
+        try std.testing.expectEqual(@as(u64, 3), store.header.seq);
+        try std.testing.expectEqual(@as(u64, 3), store.wal_writer.?.getSequence());
+        try std.testing.expectEqual(@as(u64, 4), try commitKey(store, 4));
+    }
+}
+
+test "a store whose WAL cannot open refuses to start" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("wal.bin");
+
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    try std.testing.expectError(error.IsDir, TestStore.init(allocator, .{ .data_dir = path, .cache_size_mb = 16 }));
+}
+
+test "recover truncates the WAL after its post-replay checkpoint" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    {
+        var w = try wal.WalWriter.init(allocator, dir, 32, 0, true);
+        defer w.deinit();
+        var i: u64 = 1;
+        while (i <= 5) : (i += 1) {
+            const encoded = try serializeTestRecord(allocator, .{ .id = i });
+            defer allocator.free(encoded);
+            _ = try w.append(1, encoded);
+        }
+        try w.sync();
+    }
+    try std.testing.expect(!try walIsEmpty(dir));
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    try store.recover(store, .{
+        .apply_entry = replayTestRecord,
+        .on_replayed = noopHook,
+        .bootstrap = noopHook,
+    });
+
+    try std.testing.expectEqual(@as(u64, 5), store.header.seq);
+    try std.testing.expect(try walIsEmpty(dir));
+    try expectKeyPresent(store, 5, true);
+}
+
+test "a drain that fails midway keeps the newest value visible and the retry drains it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    const oversized = try allocator.alloc(u8, page.BODY_SIZE + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 'o');
+
+    try store.memtable("by_id").put(&codec.encodeU64(1), "one");
+    try store.memtable("by_id").put(&codec.encodeU64(2), oversized);
+    try std.testing.expectError(error.ValueTooLarge, store.drainMemtables());
+
+    try std.testing.expectEqualSlices(u8, "one", store.memtable("by_id").get(&codec.encodeU64(1)).found);
+    try store.memtable("by_id").put(&codec.encodeU64(2), "two");
+    try std.testing.expectEqualSlices(u8, "two", store.memtable("by_id").get(&codec.encodeU64(2)).found);
+
+    try store.drainMemtables();
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, "one", (try store.tree("by_id").search(&codec.encodeU64(1), &buf)).?);
+    try std.testing.expectEqualSlices(u8, "two", (try store.tree("by_id").search(&codec.encodeU64(2), &buf)).?);
+    try std.testing.expect(store.memtable("by_id").get(&codec.encodeU64(2)) == .not_found);
 }
