@@ -204,7 +204,9 @@ arm64 (`ubuntu-24.04-arm`) plus a `-Dcpu=baseline` build.
 
 ## Versioning
 
-semver. MAJOR for any wire-format or public-API break; MINOR is additive only. Extend ops
+semver. 3.0.0 is the Zig 0.16 port: every public constructor takes `io: std.Io` first and
+`ServerConfig.fromEnv` takes the process `Environ.Map`; the on-disk, WAL, and wire formats are
+unchanged from 2.x. MAJOR for any wire-format or public-API break; MINOR is additive only. Extend ops
 with optional trailing bytes; never fork an op number. Published tags are never moved (the
 dependency hash is content-addressed). See [`CLAUDE.md`](CLAUDE.md) and
 [`.claude/rules/`](.claude/rules/) for the engineering contract.
