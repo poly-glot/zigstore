@@ -1,6 +1,7 @@
-//! Point-in-time snapshot of a store's durable state: under the apply and drain locks the
-//! caller's cache and header are flushed, then a `snapshot.meta` superblock recording the WAL
-//! sequence and page count is written atomically (temp file + rename + directory fsync).
+//! Point-in-time snapshot of a store's durable state: under the drain and apply locks the
+//! host runs its atomic checkpoint (drain, journaled page + header write, WAL truncation),
+//! then a `snapshot.meta` superblock recording the checkpoint's WAL sequence and page count
+//! is written atomically (temp file + rename + directory fsync).
 //!
 //! The engine names no application type. A consumer drives a snapshot through `SnapshotHost`,
 //! the small interface a generated `Store` satisfies via `Store.snapshotHost()`.
@@ -18,16 +19,16 @@ pub const SnapshotResult = struct {
 };
 
 /// The seam between the generic snapshot routine and a concrete store. The host hands over the
-/// in-progress guard, the data directory, the two locks held while flushing, and four function
-/// pointers (each closing over the store as `ctx`) for the durability work and the page count.
+/// in-progress guard, the data directory, the two locks taken (drain, then apply) around the
+/// checkpoint, and two function pointers closing over the store as `ctx`: `checkpointLocked`
+/// (the store's checkpoint body, run with both locks held; returns the durable WAL sequence)
+/// and `pageCount`.
 pub const SnapshotHost = struct {
     snapshot_in_progress: *std.atomic.Value(bool),
     data_dir: []const u8,
     apply_mutex: *std.Thread.Mutex,
     mt_drain_mutex: *std.Thread.Mutex,
-    walSequence: *const fn (ctx: *anyopaque) u64,
-    flushCache: *const fn (ctx: *anyopaque) anyerror!void,
-    flushHeader: *const fn (ctx: *anyopaque) anyerror!void,
+    checkpointLocked: *const fn (ctx: *anyopaque) anyerror!u64,
     pageCount: *const fn (ctx: *anyopaque) u64,
     ctx: *anyopaque,
 };
@@ -42,7 +43,7 @@ pub fn forceSnapshot(host: SnapshotHost) !SnapshotResult {
 pub const BASE_BACKUP_FILE = "store.dat.base";
 
 /// Like `forceSnapshot`, but additionally copies `store.dat` to `store.dat.base` while the
-/// apply and drain locks are still held, so the copy is page-consistent at the returned WAL
+/// drain and apply locks are still held, so the copy is page-consistent at the returned WAL
 /// sequence (pages mutate in place — an unlocked copy could tear). Serves a replica base
 /// backup; the caller owns deleting the copy once consumed.
 pub fn forceBaseBackup(host: SnapshotHost) !SnapshotResult {
@@ -57,10 +58,8 @@ fn takeSnapshot(host: SnapshotHost, copy_base: bool) !SnapshotResult {
 
     const start_ns = std.time.nanoTimestamp();
 
-    const wal_seq: u64 = host.walSequence(host.ctx);
-
     var mgr = SnapshotManager.init(host.data_dir, 0);
-    try flushUnderLocks(host, copy_base);
+    const wal_seq = try checkpointUnderLocks(host, copy_base);
     try mgr.writeMeta(host, wal_seq);
 
     const end_ns = std.time.nanoTimestamp();
@@ -68,15 +67,15 @@ fn takeSnapshot(host: SnapshotHost, copy_base: bool) !SnapshotResult {
     return .{ .wal_sequence = wal_seq, .duration_ms = duration_ms };
 }
 
-fn flushUnderLocks(host: SnapshotHost, copy_base: bool) !void {
-    host.apply_mutex.lock();
-    defer host.apply_mutex.unlock();
+fn checkpointUnderLocks(host: SnapshotHost, copy_base: bool) !u64 {
     host.mt_drain_mutex.lock();
     defer host.mt_drain_mutex.unlock();
+    host.apply_mutex.lock();
+    defer host.apply_mutex.unlock();
 
-    try host.flushCache(host.ctx);
-    try host.flushHeader(host.ctx);
+    const wal_seq = try host.checkpointLocked(host.ctx);
     if (copy_base) try copyStoreToBase(host.data_dir);
+    return wal_seq;
 }
 
 fn copyStoreToBase(data_dir: []const u8) !void {
@@ -91,6 +90,21 @@ fn copyStoreToBase(data_dir: []const u8) !void {
     const copy = try std.fs.cwd().openFile(dst, .{ .mode = .read_write });
     defer copy.close();
     try copy.sync();
+}
+
+/// `fsync` a directory so a rename, create, or delete inside it is durable. Failures are logged
+/// at `warn`, never returned: the data write itself has already been fsynced by the caller.
+pub fn fsyncDir(path: []const u8) void {
+    const log = std.log.scoped(.snapshot);
+    const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const fd = std.posix.open(path, flags, 0) catch |err| {
+        log.warn("dir open failed for fsync: {}", .{err});
+        return;
+    };
+    defer std.posix.close(fd);
+    std.posix.fsync(fd) catch |err| {
+        log.warn("dir fsync failed: {}", .{err});
+    };
 }
 
 /// The `snapshot.meta` superblock: magic, version, the consistent WAL sequence, the wall-clock
@@ -131,15 +145,11 @@ pub const SnapshotManager = struct {
         return (now - self.last_snapshot_time) >= @as(i64, self.interval_s);
     }
 
-    /// Flush the host's cache and header under the apply and drain locks, then write
-    /// `snapshot.meta` atomically (temp file, rename, directory fsync) recording
-    /// `wal_sequence` and the host's current page count.
-    pub fn createSnapshot(
-        self: *SnapshotManager,
-        host: SnapshotHost,
-        wal_sequence: u64,
-    ) !void {
-        try flushUnderLocks(host, false);
+    /// Checkpoint the host under the drain and apply locks, then write `snapshot.meta`
+    /// atomically (temp file, rename, directory fsync) recording the checkpoint's WAL
+    /// sequence and the host's current page count.
+    pub fn createSnapshot(self: *SnapshotManager, host: SnapshotHost) !void {
+        const wal_sequence = try checkpointUnderLocks(host, false);
         try self.writeMeta(host, wal_sequence);
     }
 
@@ -172,19 +182,6 @@ pub const SnapshotManager = struct {
         fsyncDir(self.data_dir);
 
         self.last_snapshot_time = now;
-    }
-
-    fn fsyncDir(path: []const u8) void {
-        const log = std.log.scoped(.snapshot);
-        const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
-        const fd = std.posix.open(path, flags, 0) catch |err| {
-            log.warn("snapshot: dir open failed for fsync: {}", .{err});
-            return;
-        };
-        defer std.posix.close(fd);
-        std.posix.fsync(fd) catch |err| {
-            log.warn("snapshot: dir fsync failed: {}", .{err});
-        };
     }
 
     /// Read back `snapshot.meta` from `data_dir`, or `null` if none exists. Errors on a bad magic.
@@ -301,22 +298,14 @@ test "shouldSnapshot respects interval" {
 }
 
 const SnapProbe = struct {
-    flush_cache_calls: usize = 0,
-    flush_header_calls: usize = 0,
+    checkpoint_calls: usize = 0,
     seq: u64,
     pages: u64,
 
-    fn walSequence(ctx: *anyopaque) u64 {
+    fn checkpointLocked(ctx: *anyopaque) anyerror!u64 {
         const self: *SnapProbe = @ptrCast(@alignCast(ctx));
+        self.checkpoint_calls += 1;
         return self.seq;
-    }
-    fn flushCache(ctx: *anyopaque) anyerror!void {
-        const self: *SnapProbe = @ptrCast(@alignCast(ctx));
-        self.flush_cache_calls += 1;
-    }
-    fn flushHeader(ctx: *anyopaque) anyerror!void {
-        const self: *SnapProbe = @ptrCast(@alignCast(ctx));
-        self.flush_header_calls += 1;
     }
     fn pageCount(ctx: *anyopaque) u64 {
         const self: *SnapProbe = @ptrCast(@alignCast(ctx));
@@ -324,7 +313,7 @@ const SnapProbe = struct {
     }
 };
 
-test "forceSnapshot over a host flushes, writes snapshot.meta, and records seq/page_count" {
+test "forceSnapshot over a host checkpoints once, writes snapshot.meta, and records the checkpoint's seq/page_count" {
     const tmp_dir = "/tmp/snapshot_test_host";
     std.fs.deleteTreeAbsolute(tmp_dir) catch {};
     std.fs.makeDirAbsolute(tmp_dir) catch {};
@@ -340,17 +329,14 @@ test "forceSnapshot over a host flushes, writes snapshot.meta, and records seq/p
         .data_dir = tmp_dir,
         .apply_mutex = &apply_mutex,
         .mt_drain_mutex = &drain_mutex,
-        .walSequence = SnapProbe.walSequence,
-        .flushCache = SnapProbe.flushCache,
-        .flushHeader = SnapProbe.flushHeader,
+        .checkpointLocked = SnapProbe.checkpointLocked,
         .pageCount = SnapProbe.pageCount,
         .ctx = &probe,
     };
 
     const result = try forceSnapshot(host);
     try std.testing.expectEqual(@as(u64, 7), result.wal_sequence);
-    try std.testing.expectEqual(@as(usize, 1), probe.flush_cache_calls);
-    try std.testing.expectEqual(@as(usize, 1), probe.flush_header_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.checkpoint_calls);
     try std.testing.expect(!in_progress.load(.acquire));
 
     const loaded = (try SnapshotManager.loadSnapshotMeta(tmp_dir)).?;
@@ -374,9 +360,7 @@ test "forceSnapshot rejects a concurrent snapshot via the in-progress guard" {
         .data_dir = tmp_dir,
         .apply_mutex = &apply_mutex,
         .mt_drain_mutex = &drain_mutex,
-        .walSequence = SnapProbe.walSequence,
-        .flushCache = SnapProbe.flushCache,
-        .flushHeader = SnapProbe.flushHeader,
+        .checkpointLocked = SnapProbe.checkpointLocked,
         .pageCount = SnapProbe.pageCount,
         .ctx = &probe,
     };

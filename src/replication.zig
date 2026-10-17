@@ -208,10 +208,12 @@ pub const PrimaryHost = struct {
 };
 
 /// The follower-side seam a `Receiver` applies through: the replica's WAL writer, the
-/// store's apply ordering state, the read-only and streaming flags, and the consumer's
-/// apply hook (the same shape `recover` takes). Obtain one via
-/// `Store.replicaHost(ctx, apply_entry)`. `streaming` is held true for the receiver's
-/// lifetime so the store's `promote` can refuse while streamed appends are still possible.
+/// store's apply ordering state, the read-only and streaming flags, the store's page-cache
+/// pressure valve (`relieve_pressure`, called before each append with no lock held, so a
+/// streamed burst cannot exhaust the no-steal cache), and the consumer's apply hook (the same
+/// shape `recover` takes). Obtain one via `Store.replicaHost(ctx, apply_entry)`. `streaming`
+/// is held true for the receiver's lifetime so the store's `promote` can refuse while streamed
+/// appends are still possible.
 pub const ReplicaHost = struct {
     wal: *wal.WalWriter,
     apply_mutex: *std.Thread.Mutex,
@@ -219,6 +221,8 @@ pub const ReplicaHost = struct {
     last_applied_seq: *u64,
     read_only: *std.atomic.Value(bool),
     streaming: *std.atomic.Value(bool),
+    store_ctx: *anyopaque,
+    relieve_pressure: *const fn (store_ctx: *anyopaque) anyerror!void,
     ctx: *anyopaque,
     apply_entry: *const fn (ctx: *anyopaque, entry: wal_replay.ReplayEntry) anyerror!void,
 };
@@ -919,12 +923,15 @@ pub const Receiver = struct {
         const expected = self.host.wal.getSequence() + 1;
         if (header.sequence != expected) return error.SequenceGap;
 
+        self.host.relieve_pressure(self.host.store_ctx) catch return error.ApplyFailed;
         const seq = self.host.wal.append(header.op_code, data_buf.items) catch return error.LocalWalFailed;
         if (seq != header.sequence) return error.LocalWalFailed;
 
         {
             self.host.apply_mutex.lock();
             defer self.host.apply_mutex.unlock();
+            defer self.host.apply_cond.broadcast();
+            defer self.host.last_applied_seq.* = seq;
             self.host.apply_entry(self.host.ctx, .{
                 .sequence = seq,
                 .op_code = header.op_code,
@@ -933,8 +940,6 @@ pub const Receiver = struct {
                 log.err("replication: apply of entry {d} failed: {}", .{ seq, err });
                 return error.ApplyFailed;
             };
-            self.host.last_applied_seq.* = seq;
-            self.host.apply_cond.broadcast();
         }
         self.last_applied.store(seq, .release);
 
@@ -1426,7 +1431,6 @@ test "a follower behind a truncated WAL parks in needs_rebootstrap" {
     try commitTestRecord(leader, 2, 2);
     try commitTestRecord(leader, 3, 3);
     _ = try snapshot.forceSnapshot(leader.snapshotHost());
-    try leader.wal_writer.?.truncateAfterCheckpoint();
 
     const hub = try Hub.start(allocator, try leader.primaryHost(), .{});
     defer hub.stop();

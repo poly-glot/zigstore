@@ -55,7 +55,7 @@ fn routeHash(key: []const u8) u64 {
 ///
 /// The returned type exposes `Config`, `init`/`deinit`, deterministic routing (`shardIndexFor`,
 /// `shardFor`), a convenience durable `commit`, and the fan-out maintenance/recovery seams
-/// (`recoverAll`, `drainMemtablesAll`, `flushHeaderAll`, aggregate `healthStatus`). The `shards`
+/// (`recoverAll`, `drainMemtablesAll`, `checkpointAll`, aggregate `healthStatus`). The `shards`
 /// slice is public so a consumer can reach an individual `*Store` for per-shard work the set does
 /// not fan out (replication, snapshots, single-shard range scans).
 pub fn ShardSet(comptime Store: type) type {
@@ -217,9 +217,10 @@ pub fn ShardSet(comptime Store: type) type {
             for (self.shards) |s| try s.drainMemtables();
         }
 
-        /// Flush every shard's superblock to disk, in shard order.
-        pub fn flushHeaderAll(self: *Self) !void {
-            for (self.shards) |s| try s.flushHeader();
+        /// Checkpoint every shard (drain, write pages and superblock atomically, truncate its
+        /// WAL), in shard order.
+        pub fn checkpointAll(self: *Self) !void {
+            for (self.shards) |s| _ = try s.checkpoint();
         }
 
         /// The set's health, reduced across shards for a worst-case readiness probe: `read_only`
@@ -392,7 +393,7 @@ test "reopen with the same shard_count preserves the partitioning and finds ever
         defer set.deinit();
         var key: u64 = 0;
         while (key < 500) : (key += 1) try commitTestKey(set, key);
-        try set.flushHeaderAll();
+        try set.checkpointAll();
     }
 
     {
