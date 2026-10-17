@@ -84,14 +84,14 @@ pub const MemTable = struct {
         const shard = self.getShard(key);
         shard.lock.lock();
         defer shard.lock.unlock();
-        return getFrom(&shard.front, key);
+        return getFromShard(shard, key);
     }
 
     pub fn putIfAbsent(self: *MemTable, key: []const u8, value: []const u8) !bool {
         const shard = self.getShard(key);
         shard.lock.lock();
         defer shard.lock.unlock();
-        const result = getFrom(&shard.front, key);
+        const result = getFromShard(shard, key);
         switch (result) {
             .found => return false,
             .deleted => {},
@@ -143,6 +143,13 @@ pub const MemTable = struct {
         buf.map.put(owned_key, .{ .value = owned_val, .tombstone = tombstone }) catch |err| {
             log.err("memtable put failed: {}", .{err});
             return err;
+        };
+    }
+
+    fn getFromShard(shard: *const Shard, key: []const u8) GetResult {
+        return switch (getFrom(&shard.front, key)) {
+            .not_found => getFrom(&shard.back, key),
+            else => |hit| hit,
         };
     }
 
@@ -249,4 +256,39 @@ test "MemTable concurrent writers" {
     for (&threads) |t| t.join();
 
     try std.testing.expectEqual(@as(u32, 4000), mt.count());
+}
+
+test "a row a drain swapped into the back buffer stays visible until the drain resets it" {
+    var mt = MemTable.init(std.testing.allocator);
+    defer mt.deinit();
+
+    try mt.put("swapped", "value");
+    mt.lockAll();
+    for (0..NUM_SHARDS) |i| _ = mt.swapShardLocked(i);
+    mt.unlockAll();
+
+    try std.testing.expectEqualSlices(u8, "value", mt.get("swapped").found);
+    try std.testing.expect(!try mt.putIfAbsent("swapped", "other"));
+
+    mt.lockAll();
+    for (0..NUM_SHARDS) |i| mt.resetShardBackLocked(i);
+    mt.unlockAll();
+
+    try std.testing.expect(mt.get("swapped") == .not_found);
+}
+
+test "a tombstone written during a drain shadows the swapped-out value" {
+    var mt = MemTable.init(std.testing.allocator);
+    defer mt.deinit();
+
+    try mt.put("k", "old");
+    mt.lockAll();
+    for (0..NUM_SHARDS) |i| _ = mt.swapShardLocked(i);
+    mt.unlockAll();
+
+    try mt.delete("k");
+    try std.testing.expect(mt.get("k") == .deleted);
+
+    try mt.put("k", "new");
+    try std.testing.expectEqualSlices(u8, "new", mt.get("k").found);
 }
