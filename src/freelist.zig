@@ -7,21 +7,23 @@ pub const FreeListError = error{
 };
 
 pub const FreeList = struct {
+    io: std.Io,
     head: page.PageId,
     cache: *page_cache.PageCache,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
-    pub fn init(cache: *page_cache.PageCache, head: page.PageId) FreeList {
+    pub fn init(io: std.Io, cache: *page_cache.PageCache, head: page.PageId) FreeList {
         return FreeList{
+            .io = io,
             .head = head,
             .cache = cache,
-            .mutex = .{},
+            .mutex = .init,
         };
     }
 
     pub fn allocPage(self: *FreeList) !page.PageId {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const log = std.log.scoped(.freelist);
         var skipped: u32 = 0;
@@ -59,8 +61,8 @@ pub const FreeList = struct {
     }
 
     pub fn freePage(self: *FreeList, pid: page.PageId) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const pg_raw = try self.cache.getPageMut(pid);
         const pg: *page.Page = @ptrCast(@alignCast(pg_raw));
@@ -82,30 +84,34 @@ pub const FreeList = struct {
     }
 
     pub fn getHead(self: *FreeList) page.PageId {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.head;
     }
 };
 
-fn createTempFile() !std.fs.File {
-    return std.fs.cwd().createFile("/tmp/test_freelist.db", .{
+fn createTempFile() !std.Io.File {
+    return std.Io.Dir.cwd().createFile(std.testing.io, "/tmp/test_freelist.db", .{
         .read = true,
         .truncate = true,
     });
 }
 
+fn deleteTempFile() void {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "/tmp/test_freelist.db") catch {};
+}
+
 test "alloc free roundtrip" {
     const file = try createTempFile();
-    defer file.close();
-    defer std.fs.cwd().deleteFile("/tmp/test_freelist.db") catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile();
 
-    try file.setEndPos(page.PAGE_SIZE);
+    try file.setLength(std.testing.io, page.PAGE_SIZE);
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 16);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 16);
     defer cache.deinit();
 
-    var fl = FreeList.init(&cache, page.INVALID_PAGE);
+    var fl = FreeList.init(std.testing.io, &cache, page.INVALID_PAGE);
 
     const p1 = try fl.allocPage();
     const p2 = try fl.allocPage();
@@ -149,13 +155,13 @@ test "alloc free roundtrip" {
 
 test "double free detection" {
     const file = try createTempFile();
-    defer file.close();
-    defer std.fs.cwd().deleteFile("/tmp/test_freelist.db") catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, page_cache.NUM_SHARDS * 4);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, page_cache.NUM_SHARDS * 4);
     defer cache.deinit();
 
-    var fl = FreeList.init(&cache, page.INVALID_PAGE);
+    var fl = FreeList.init(std.testing.io, &cache, page.INVALID_PAGE);
 
     const p1 = try fl.allocPage();
     {
@@ -170,13 +176,13 @@ test "double free detection" {
 
 test "freelist getHead with mutex" {
     const file = try createTempFile();
-    defer file.close();
-    defer std.fs.cwd().deleteFile("/tmp/test_freelist.db") catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, page_cache.NUM_SHARDS * 4);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, page_cache.NUM_SHARDS * 4);
     defer cache.deinit();
 
-    var fl = FreeList.init(&cache, page.INVALID_PAGE);
+    var fl = FreeList.init(std.testing.io, &cache, page.INVALID_PAGE);
     try std.testing.expectEqual(page.INVALID_PAGE, fl.getHead());
 
     const p1 = try fl.allocPage();

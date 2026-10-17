@@ -5,7 +5,8 @@
 //! at any point leaves `store.dat` either entirely pre-checkpoint or entirely post-checkpoint.
 
 const std = @import("std");
-const posix = std.posix;
+const Io = std.Io;
+const sys = @import("sys.zig");
 const page = @import("page.zig");
 
 const log = std.log.scoped(.page_cache);
@@ -31,10 +32,10 @@ pub const NUM_SHARDS = 64;
 const CacheShard = struct {
     map: std.AutoHashMap(page.PageId, *CacheEntry),
     entries: []CacheEntry,
-    free_list: std.ArrayListUnmanaged(*CacheEntry),
+    free_list: std.ArrayList(*CacheEntry),
     head: ?*CacheEntry,
     tail: ?*CacheEntry,
-    lock: std.Thread.Mutex,
+    lock: Io.Mutex,
 };
 
 /// The `checkpoint.journal` magic: ASCII "CKPJ".
@@ -52,7 +53,7 @@ pub const JournalHeader = extern struct {
     record_count: u32,
     _pad: u32 = 0,
     crc32: u32,
-    _reserved: [12]u8 = [_]u8{0} ** 12,
+    _reserved: [12]u8 = @splat(0),
 };
 
 comptime {
@@ -63,18 +64,19 @@ const JOURNAL_HEADER_SIZE: usize = @sizeOf(JournalHeader);
 const JOURNAL_RECORD_SIZE: usize = @sizeOf(u32) + page.PAGE_SIZE;
 
 pub const PageCache = struct {
+    io: Io,
     shards: [NUM_SHARDS]CacheShard,
-    file: std.fs.File,
+    file: Io.File,
     allocator: std.mem.Allocator,
     hit_count: std.atomic.Value(u64),
     miss_count: std.atomic.Value(u64),
     page_count: u32,
-    alloc_lock: std.Thread.Mutex,
+    alloc_lock: Io.Mutex,
     capacity: u32,
     dirty_count: std.atomic.Value(u32),
 
-    pub fn init(allocator: std.mem.Allocator, file: std.fs.File, capacity: usize) !PageCache {
-        const file_size = file.getEndPos() catch 0;
+    pub fn init(io: Io, allocator: std.mem.Allocator, file: Io.File, capacity: usize) !PageCache {
+        const file_size = file.length(io) catch 0;
         const raw_count = file_size / page.PAGE_SIZE;
         const reserved = @max(raw_count, 1);
         const pc: u32 = if (reserved > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(reserved);
@@ -82,13 +84,14 @@ pub const PageCache = struct {
         const per_shard = @max(capacity / NUM_SHARDS, 1);
 
         var self = PageCache{
+            .io = io,
             .shards = undefined,
             .file = file,
             .allocator = allocator,
             .hit_count = std.atomic.Value(u64).init(0),
             .miss_count = std.atomic.Value(u64).init(0),
             .page_count = pc,
-            .alloc_lock = .{},
+            .alloc_lock = .init,
             .capacity = @intCast(per_shard * NUM_SHARDS),
             .dirty_count = std.atomic.Value(u32).init(0),
         };
@@ -107,7 +110,7 @@ pub const PageCache = struct {
             const entries = try allocator.alloc(CacheEntry, per_shard);
             errdefer allocator.free(entries);
 
-            var fl: std.ArrayListUnmanaged(*CacheEntry) = .{};
+            var fl: std.ArrayList(*CacheEntry) = .empty;
             errdefer fl.deinit(allocator);
             try fl.ensureTotalCapacity(allocator, per_shard);
 
@@ -122,7 +125,7 @@ pub const PageCache = struct {
                 .free_list = fl,
                 .head = null,
                 .tail = null,
-                .lock = .{},
+                .lock = .init,
             };
             built += 1;
         }
@@ -159,8 +162,8 @@ pub const PageCache = struct {
 
     fn fetchPage(self: *PageCache, page_id: page.PageId, mark_dirty: bool) !*page.Page {
         const shard = &self.shards[shardIndex(page_id)];
-        shard.lock.lock();
-        defer shard.lock.unlock();
+        shard.lock.lockUncancelable(self.io);
+        defer shard.lock.unlock(self.io);
 
         if (shard.map.get(page_id)) |entry| {
             _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -197,8 +200,8 @@ pub const PageCache = struct {
 
     pub fn unpinPage(self: *PageCache, page_id: page.PageId) void {
         const shard = &self.shards[shardIndex(page_id)];
-        shard.lock.lock();
-        defer shard.lock.unlock();
+        shard.lock.lockUncancelable(self.io);
+        defer shard.lock.unlock(self.io);
 
         if (shard.map.get(page_id)) |entry| {
             if (entry.pin_count > 0) {
@@ -220,75 +223,75 @@ pub const PageCache = struct {
     /// `store.dat` (header page last), `fdatasync`ed, and the pages marked clean. The caller
     /// holds the store's drain and apply locks so nothing dirties a page between the two phases,
     /// and empties the journal afterward. The only path that writes tree pages.
-    pub fn checkpoint(self: *PageCache, journal: std.fs.File, header_page: *const [page.PAGE_SIZE]u8) !void {
+    pub fn checkpoint(self: *PageCache, journal: Io.File, header_page: *const [page.PAGE_SIZE]u8) !void {
         _ = try self.writeJournal(journal, header_page);
         try self.writeDirtyPagesInPlace();
-        try self.file.pwriteAll(header_page, 0);
-        posix.fdatasync(self.file.handle) catch |err| {
+        try sys.pwriteAll(self.file.handle, header_page, 0);
+        sys.fdatasync(self.file.handle) catch |err| {
             log.err("checkpoint: fdatasync failed: {}", .{err});
             return CacheError.DiskError;
         };
         self.markAllClean();
     }
 
-    fn writeJournal(self: *PageCache, journal: std.fs.File, header_page: *const [page.PAGE_SIZE]u8) !u32 {
-        try journal.setEndPos(0);
+    fn writeJournal(self: *PageCache, journal: Io.File, header_page: *const [page.PAGE_SIZE]u8) !u32 {
+        try sys.ftruncate(journal.handle, 0);
 
         var crc = std.hash.crc.Crc32.init();
         var offset: u64 = JOURNAL_HEADER_SIZE;
         var count: u32 = 0;
 
         for (&self.shards) |*shard| {
-            shard.lock.lock();
-            defer shard.lock.unlock();
+            shard.lock.lockUncancelable(self.io);
+            defer shard.lock.unlock(self.io);
 
             var it = shard.map.iterator();
             while (it.next()) |kv| {
                 const entry = kv.value_ptr.*;
                 if (!entry.dirty) continue;
                 stampChecksum(&entry.data);
-                try appendJournalRecord(journal, &crc, &offset, entry.page_id, &entry.data);
+                try appendJournalRecord(journal.handle, &crc, &offset, entry.page_id, &entry.data);
                 count += 1;
             }
         }
 
-        try appendJournalRecord(journal, &crc, &offset, 0, header_page);
+        try appendJournalRecord(journal.handle, &crc, &offset, 0, header_page);
         count += 1;
 
         const header = JournalHeader{ .record_count = count, .crc32 = crc.final() };
-        try journal.pwriteAll(std.mem.asBytes(&header), 0);
-        try journal.sync();
+        try sys.pwriteAll(journal.handle, std.mem.asBytes(&header), 0);
+        try sys.fsync(journal.handle);
         return count;
     }
 
-    fn appendJournalRecord(journal: std.fs.File, crc: *std.hash.crc.Crc32, offset: *u64, page_id: page.PageId, data: *const [page.PAGE_SIZE]u8) !void {
+    fn appendJournalRecord(journal: sys.fd_t, crc: *std.hash.crc.Crc32, offset: *u64, page_id: page.PageId, data: *const [page.PAGE_SIZE]u8) !void {
         var id_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &id_bytes, page_id, .little);
         crc.update(&id_bytes);
         crc.update(data);
-        try journal.pwriteAll(&id_bytes, offset.*);
-        try journal.pwriteAll(data, offset.* + id_bytes.len);
+        try sys.pwriteAll(journal, &id_bytes, offset.*);
+        try sys.pwriteAll(journal, data, offset.* + id_bytes.len);
         offset.* += JOURNAL_RECORD_SIZE;
     }
 
     fn writeDirtyPagesInPlace(self: *PageCache) !void {
         for (&self.shards) |*shard| {
-            shard.lock.lock();
-            defer shard.lock.unlock();
+            shard.lock.lockUncancelable(self.io);
+            defer shard.lock.unlock(self.io);
 
             var it = shard.map.iterator();
             while (it.next()) |kv| {
                 const entry = kv.value_ptr.*;
                 if (!entry.dirty) continue;
-                try self.file.pwriteAll(&entry.data, @as(u64, entry.page_id) * page.PAGE_SIZE);
+                try sys.pwriteAll(self.file.handle, &entry.data, @as(u64, entry.page_id) * page.PAGE_SIZE);
             }
         }
     }
 
     fn markAllClean(self: *PageCache) void {
         for (&self.shards) |*shard| {
-            shard.lock.lock();
-            defer shard.lock.unlock();
+            shard.lock.lockUncancelable(self.io);
+            defer shard.lock.unlock(self.io);
 
             var it = shard.map.iterator();
             while (it.next()) |kv| {
@@ -304,31 +307,31 @@ pub const PageCache = struct {
     /// the journal was complete (magic, version, count, and CRC all valid) and every image has
     /// been written and `fdatasync`ed; `false` when it was incomplete or invalid and `file` was
     /// left untouched. The caller empties the journal either way.
-    pub fn redoJournal(journal: std.fs.File, file: std.fs.File) !bool {
-        const record_count = (try completeJournalRecordCount(journal)) orelse return false;
-        try applyJournalRecords(journal, file, record_count);
-        posix.fdatasync(file.handle) catch |err| {
+    pub fn redoJournal(io: Io, journal: Io.File, file: Io.File) !bool {
+        const record_count = (try completeJournalRecordCount(io, journal)) orelse return false;
+        try applyJournalRecords(journal.handle, file.handle, record_count);
+        sys.fdatasync(file.handle) catch |err| {
             log.err("redoJournal: fdatasync failed: {}", .{err});
             return CacheError.DiskError;
         };
         return true;
     }
 
-    fn completeJournalRecordCount(journal: std.fs.File) !?u32 {
+    fn completeJournalRecordCount(io: Io, journal: Io.File) !?u32 {
         var header_buf: [JOURNAL_HEADER_SIZE]u8 = undefined;
-        const n = try journal.preadAll(&header_buf, 0);
+        const n = try sys.preadAll(journal.handle, &header_buf, 0);
         if (n < JOURNAL_HEADER_SIZE) return null;
 
         const header = std.mem.bytesToValue(JournalHeader, &header_buf);
         if (header.magic != JOURNAL_MAGIC or header.version != JOURNAL_VERSION or header.record_count == 0) return null;
 
         const needed = JOURNAL_HEADER_SIZE + @as(u64, header.record_count) * JOURNAL_RECORD_SIZE;
-        if ((try journal.getEndPos()) < needed) return null;
+        if ((try journal.length(io)) < needed) return null;
 
         var crc = std.hash.crc.Crc32.init();
         var record: [JOURNAL_RECORD_SIZE]u8 = undefined;
         for (0..header.record_count) |i| {
-            const got = try journal.preadAll(&record, JOURNAL_HEADER_SIZE + i * JOURNAL_RECORD_SIZE);
+            const got = try sys.preadAll(journal.handle, &record, JOURNAL_HEADER_SIZE + i * JOURNAL_RECORD_SIZE);
             if (got < JOURNAL_RECORD_SIZE) return null;
             crc.update(&record);
         }
@@ -336,19 +339,19 @@ pub const PageCache = struct {
         return header.record_count;
     }
 
-    fn applyJournalRecords(journal: std.fs.File, file: std.fs.File, record_count: u32) !void {
+    fn applyJournalRecords(journal: sys.fd_t, file: sys.fd_t, record_count: u32) !void {
         var record: [JOURNAL_RECORD_SIZE]u8 = undefined;
         for (0..record_count) |i| {
-            const got = try journal.preadAll(&record, JOURNAL_HEADER_SIZE + i * JOURNAL_RECORD_SIZE);
+            const got = try sys.preadAll(journal, &record, JOURNAL_HEADER_SIZE + i * JOURNAL_RECORD_SIZE);
             if (got < JOURNAL_RECORD_SIZE) return CacheError.DiskError;
             const page_id = std.mem.readInt(u32, record[0..4], .little);
-            try file.pwriteAll(record[4..], @as(u64, page_id) * page.PAGE_SIZE);
+            try sys.pwriteAll(file, record[4..], @as(u64, page_id) * page.PAGE_SIZE);
         }
     }
 
     pub fn allocatePage(self: *PageCache) !page.PageId {
-        self.alloc_lock.lock();
-        defer self.alloc_lock.unlock();
+        self.alloc_lock.lockUncancelable(self.io);
+        defer self.alloc_lock.unlock(self.io);
 
         if (self.page_count >= page.INVALID_PAGE) {
             return CacheError.PageLimitExhausted;
@@ -357,13 +360,8 @@ pub const PageCache = struct {
         self.page_count += 1;
 
         const offset: u64 = @as(u64, new_id) * page.PAGE_SIZE;
-        const zeros = [_]u8{0} ** page.PAGE_SIZE;
-        var total_written: usize = 0;
-        while (total_written < page.PAGE_SIZE) {
-            const n = std.posix.pwrite(self.file.handle, zeros[total_written..], offset + total_written) catch return CacheError.DiskError;
-            if (n == 0) return CacheError.DiskError;
-            total_written += n;
-        }
+        const zeros: [page.PAGE_SIZE]u8 = @splat(0);
+        sys.pwriteAll(self.file.handle, &zeros, offset) catch return CacheError.DiskError;
 
         return new_id;
     }
@@ -410,14 +408,9 @@ pub const PageCache = struct {
         return CacheError.CacheFull;
     }
 
-    fn readFromDisk(page_id: page.PageId, buf: *[page.PAGE_SIZE]u8, file_handle: std.posix.fd_t) !void {
+    fn readFromDisk(page_id: page.PageId, buf: *[page.PAGE_SIZE]u8, file_handle: sys.fd_t) !void {
         const offset: u64 = @as(u64, page_id) * page.PAGE_SIZE;
-        var total_read: usize = 0;
-        while (total_read < page.PAGE_SIZE) {
-            const n = std.posix.pread(file_handle, buf[total_read..], offset + total_read) catch return CacheError.DiskError;
-            if (n == 0) break;
-            total_read += n;
-        }
+        const total_read = sys.preadAll(file_handle, buf, offset) catch return CacheError.DiskError;
 
         if (total_read == 0) {
             @memset(buf, 0);
@@ -441,19 +434,23 @@ pub const PageCache = struct {
     }
 };
 
-fn createTempFile() !std.fs.File {
-    return std.fs.cwd().createFile("/tmp/test_page_cache.db", .{
+fn createTempFile() !Io.File {
+    return Io.Dir.cwd().createFile(std.testing.io, "/tmp/test_page_cache.db", .{
         .read = true,
         .truncate = true,
     });
 }
 
+fn deleteTempFile(path: []const u8) void {
+    Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+}
+
 test "basic get, unpin, and re-fetch" {
     const file = try createTempFile();
-    defer file.close();
-    defer std.fs.cwd().deleteFile("/tmp/test_page_cache.db") catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile("/tmp/test_page_cache.db");
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 4);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS * 4);
     defer cache.deinit();
 
     const pid = try cache.allocatePage();
@@ -476,10 +473,10 @@ test "basic get, unpin, and re-fetch" {
 
 test "eviction of LRU" {
     const file = try createTempFile();
-    defer file.close();
-    defer std.fs.cwd().deleteFile("/tmp/test_page_cache.db") catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile("/tmp/test_page_cache.db");
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS);
     defer cache.deinit();
 
     var pids: [2]page.PageId = undefined;
@@ -503,10 +500,10 @@ test "eviction of LRU" {
 
 test "pin prevents eviction" {
     const file = try createTempFile();
-    defer file.close();
-    defer std.fs.cwd().deleteFile("/tmp/test_page_cache.db") catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile("/tmp/test_page_cache.db");
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS);
     defer cache.deinit();
 
     for (0..NUM_SHARDS + 1) |_| {
@@ -527,17 +524,17 @@ test "pin prevents eviction" {
     cache.unpinPage(pid2);
 }
 
-fn createTempFileAt(path: []const u8) !std.fs.File {
-    return std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+fn createTempFileAt(path: []const u8) !Io.File {
+    return Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
 }
 
 test "LRU evicts oldest unpinned" {
     const path = "/tmp/test_page_cache_lru.db";
     const file = try createTempFileAt(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile(path);
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 2);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS * 2);
     defer cache.deinit();
 
     for (0..2 * NUM_SHARDS + 1) |_| _ = try cache.allocatePage();
@@ -555,8 +552,8 @@ test "LRU evicts oldest unpinned" {
     cache.unpinPage(c);
 
     const shard = &cache.shards[0];
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(std.testing.io);
+    defer shard.lock.unlock(std.testing.io);
     try std.testing.expect(shard.map.get(a) == null);
     try std.testing.expect(shard.map.get(b) != null);
     try std.testing.expect(shard.map.get(c) != null);
@@ -569,10 +566,10 @@ fn shardIndexExternal(pid: page.PageId) usize {
 test "cross-shard pages access without contention" {
     const path = "/tmp/test_page_cache_xshard.db";
     const file = try createTempFileAt(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile(path);
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 2);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS * 2);
     defer cache.deinit();
 
     _ = try cache.allocatePage();
@@ -593,10 +590,10 @@ test "cross-shard pages access without contention" {
 test "re-pin after unpin returns same bytes" {
     const path = "/tmp/test_page_cache_repin.db";
     const file = try createTempFileAt(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile(path);
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 4);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS * 4);
     defer cache.deinit();
 
     const pid = try cache.allocatePage();
@@ -623,18 +620,18 @@ fn fillLeaf(cache: *PageCache, pid: page.PageId, key: []const u8, value: []const
     cache.unpinPage(pid);
 }
 
-fn readPageBytes(file: std.fs.File, pid: page.PageId, out: *[page.PAGE_SIZE]u8) !void {
-    const got = try file.preadAll(out, @as(u64, pid) * page.PAGE_SIZE);
+fn readPageBytes(file: Io.File, pid: page.PageId, out: *[page.PAGE_SIZE]u8) !void {
+    const got = try file.readPositionalAll(std.testing.io, out, @as(u64, pid) * page.PAGE_SIZE);
     try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), got);
 }
 
 test "a dirty page is never evicted: when every unpinned frame is dirty the cache reports CacheFull" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("store.dat", .{ .read = true });
-    defer file.close();
+    const file = try tmp.dir.createFile(std.testing.io, "store.dat", .{ .read = true });
+    defer file.close(std.testing.io);
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS);
     defer cache.deinit();
 
     for (0..NUM_SHARDS + 1) |_| _ = try cache.allocatePage();
@@ -646,9 +643,9 @@ test "a dirty page is never evicted: when every unpinned frame is dirty the cach
 
     try std.testing.expectError(CacheError.CacheFull, cache.getPage(b));
 
-    const journal = try tmp.dir.createFile("checkpoint.journal", .{ .read = true });
-    defer journal.close();
-    const header_page = [_]u8{0} ** page.PAGE_SIZE;
+    const journal = try tmp.dir.createFile(std.testing.io, "checkpoint.journal", .{ .read = true });
+    defer journal.close(std.testing.io);
+    const header_page: [page.PAGE_SIZE]u8 = @splat(0);
     try cache.checkpoint(journal, &header_page);
     try std.testing.expectEqual(@as(u32, 0), cache.dirty_count.load(.acquire));
 
@@ -659,12 +656,12 @@ test "a dirty page is never evicted: when every unpinned frame is dirty the cach
 test "dirty pages reach disk only through checkpoint: a crash before it leaves store.dat untouched" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("store.dat", .{ .read = true });
-    defer file.close();
+    const file = try tmp.dir.createFile(std.testing.io, "store.dat", .{ .read = true });
+    defer file.close(std.testing.io);
 
     var pid: page.PageId = undefined;
     {
-        var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 2);
+        var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS * 2);
         defer cache.deinit();
         pid = try cache.allocatePage();
         try fillLeaf(&cache, pid, "lost", "on-crash");
@@ -679,18 +676,18 @@ test "dirty pages reach disk only through checkpoint: a crash before it leaves s
 test "a complete journal is redone on open and an incomplete one is discarded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const source = try tmp.dir.createFile("source.dat", .{ .read = true });
-    defer source.close();
+    const source = try tmp.dir.createFile(std.testing.io, "source.dat", .{ .read = true });
+    defer source.close(std.testing.io);
 
-    var header_page = [_]u8{0} ** page.PAGE_SIZE;
+    var header_page: [page.PAGE_SIZE]u8 = @splat(0);
     header_page[0] = 0xAB;
 
-    const journal = try tmp.dir.createFile("checkpoint.journal", .{ .read = true });
-    defer journal.close();
+    const journal = try tmp.dir.createFile(std.testing.io, "checkpoint.journal", .{ .read = true });
+    defer journal.close(std.testing.io);
 
     var pid: page.PageId = undefined;
     {
-        var cache = try PageCache.init(std.testing.allocator, source, NUM_SHARDS * 2);
+        var cache = try PageCache.init(std.testing.io, std.testing.allocator, source, NUM_SHARDS * 2);
         defer cache.deinit();
         pid = try cache.allocatePage();
         try fillLeaf(&cache, pid, "journaled", "page");
@@ -698,11 +695,11 @@ test "a complete journal is redone on open and an incomplete one is discarded" {
         cache.markAllClean();
     }
 
-    const target = try tmp.dir.createFile("target.dat", .{ .read = true });
-    defer target.close();
-    try target.setEndPos(@as(u64, pid + 1) * page.PAGE_SIZE);
+    const target = try tmp.dir.createFile(std.testing.io, "target.dat", .{ .read = true });
+    defer target.close(std.testing.io);
+    try target.setLength(std.testing.io, @as(u64, pid + 1) * page.PAGE_SIZE);
 
-    try std.testing.expect(try PageCache.redoJournal(journal, target));
+    try std.testing.expect(try PageCache.redoJournal(std.testing.io, journal, target));
 
     var redone: [page.PAGE_SIZE]u8 align(4096) = undefined;
     try readPageBytes(target, pid, &redone);
@@ -712,13 +709,13 @@ test "a complete journal is redone on open and an incomplete one is discarded" {
     try readPageBytes(target, 0, &redone);
     try std.testing.expectEqual(@as(u8, 0xAB), redone[0]);
 
-    const journal_size = try journal.getEndPos();
-    try journal.setEndPos(journal_size - 1);
-    const untouched = try tmp.dir.createFile("untouched.dat", .{ .read = true });
-    defer untouched.close();
-    try untouched.setEndPos(@as(u64, pid + 1) * page.PAGE_SIZE);
+    const journal_size = try journal.length(std.testing.io);
+    try journal.setLength(std.testing.io, journal_size - 1);
+    const untouched = try tmp.dir.createFile(std.testing.io, "untouched.dat", .{ .read = true });
+    defer untouched.close(std.testing.io);
+    try untouched.setLength(std.testing.io, @as(u64, pid + 1) * page.PAGE_SIZE);
 
-    try std.testing.expect(!try PageCache.redoJournal(journal, untouched));
+    try std.testing.expect(!try PageCache.redoJournal(std.testing.io, journal, untouched));
     try readPageBytes(untouched, pid, &redone);
     try std.testing.expect(std.mem.allEqual(u8, &redone, 0));
 }
@@ -726,10 +723,10 @@ test "a complete journal is redone on open and an incomplete one is discarded" {
 test "concurrent allocatePage across threads" {
     const path = "/tmp/test_page_cache_concalloc.db";
     const file = try createTempFileAt(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile(path);
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 4);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS * 4);
     defer cache.deinit();
 
     const Worker = struct {
@@ -763,10 +760,10 @@ test "concurrent allocatePage across threads" {
 test "allocatePage assigns sequential IDs and grows file" {
     const path = "/tmp/test_page_cache_grow.db";
     const file = try createTempFileAt(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile(path);
 
-    var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 4);
+    var cache = try PageCache.init(std.testing.io, std.testing.allocator, file, NUM_SHARDS * 4);
     defer cache.deinit();
 
     const start = cache.page_count;
@@ -777,21 +774,21 @@ test "allocatePage assigns sequential IDs and grows file" {
     }
     try std.testing.expectEqual(start + 8, cache.page_count);
 
-    const size = try file.getEndPos();
+    const size = try file.length(std.testing.io);
     try std.testing.expect(size >= @as(u64, cache.page_count) * page.PAGE_SIZE);
 }
 
 test "init frees every partial allocation when an allocation fails midway" {
     const path = "/tmp/test_page_cache_init_leak.db";
     const file = try createTempFileAt(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer deleteTempFile(path);
 
     var saw_failure = false;
     var fail_index: usize = 0;
     while (fail_index < 2 * NUM_SHARDS) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var cache = PageCache.init(failing.allocator(), file, NUM_SHARDS * 4) catch {
+        var cache = PageCache.init(std.testing.io, failing.allocator(), file, NUM_SHARDS * 4) catch {
             saw_failure = true;
             continue;
         };

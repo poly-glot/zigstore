@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const wal = @import("wal.zig");
 
 const MAX_REPLAY_DATA_LEN: usize = 16 * 1024 * 1024;
@@ -14,28 +15,31 @@ pub const ReplayEntry = struct {
 };
 
 pub const WalReader = struct {
-    file: std.fs.File,
+    io: Io,
+    file: Io.File,
     buf: []u8,
     buf_len: usize = 0,
     pos: usize = 0,
     file_pos: u64 = 0,
+    read_pos: u64 = 0,
     last_sequence: u64 = 0,
 
     const INITIAL_BUF_LEN: usize = 65536;
     const MAX_BUF_LEN: usize = MAX_REPLAY_DATA_LEN + wal.HEADER_SIZE;
 
-    pub fn init(dir: []const u8) !?WalReader {
-        const path = try std.fs.path.join(std.heap.page_allocator, &.{ dir, "wal.bin" });
+    pub fn init(io: Io, dir: []const u8) !?WalReader {
+        const path = try Io.Dir.path.join(std.heap.page_allocator, &.{ dir, "wal.bin" });
         defer std.heap.page_allocator.free(path);
 
-        const file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| switch (err) {
+        const file = Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
-        errdefer file.close();
+        errdefer file.close(io);
 
         const buf = try std.heap.page_allocator.alloc(u8, INITIAL_BUF_LEN);
         return WalReader{
+            .io = io,
             .file = file,
             .buf = buf,
         };
@@ -91,10 +95,10 @@ pub const WalReader = struct {
     fn skipToNextBlock(self: *WalReader) !bool {
         const next_block: u64 = std.mem.alignForward(u64, self.file_pos + 1, BLOCK_SIZE);
 
-        const end_pos: u64 = self.file.getEndPos() catch return false;
+        const end_pos: u64 = self.file.length(self.io) catch return false;
         if (next_block >= end_pos) return false;
 
-        try self.file.seekTo(next_block);
+        self.read_pos = next_block;
         self.buf_len = 0;
         self.pos = 0;
         self.file_pos = next_block;
@@ -103,7 +107,7 @@ pub const WalReader = struct {
 
     pub fn close(self: *WalReader) void {
         std.heap.page_allocator.free(self.buf);
-        self.file.close();
+        self.file.close(self.io);
     }
 
     fn available(self: *const WalReader) usize {
@@ -127,22 +131,19 @@ pub const WalReader = struct {
         self.buf_len = remaining;
         self.pos = 0;
 
-        while (self.buf_len < self.buf.len) {
-            const n = try self.file.read(self.buf[self.buf_len..]);
-            if (n == 0) break;
-            self.buf_len += n;
-            if (self.buf_len >= needed) break;
-        }
+        const n = try self.file.readPositionalAll(self.io, self.buf[self.buf_len..], self.read_pos);
+        self.buf_len += n;
+        self.read_pos += n;
     }
 };
 
-pub fn replayWal(dir: []const u8, min_sequence: u64, callback: anytype) !u64 {
+pub fn replayWal(io: Io, dir: []const u8, min_sequence: u64, callback: anytype) !u64 {
     comptime {
         if (!@hasDecl(@TypeOf(callback.*), "apply")) {
             @compileError("replayWal callback must have a pub fn apply(self, ReplayEntry) !void method");
         }
     }
-    var reader = (try WalReader.init(dir)) orelse return 0;
+    var reader = (try WalReader.init(io, dir)) orelse return 0;
     defer reader.close();
 
     var last_seq: u64 = 0;
@@ -157,15 +158,28 @@ pub fn replayWal(dir: []const u8, min_sequence: u64, callback: anytype) !u64 {
     return last_seq;
 }
 
+fn resetTestDir(tmp_dir: []const u8) void {
+    Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
+    Io.Dir.createDirAbsolute(std.testing.io, tmp_dir, .default_dir) catch {};
+}
+
+fn removeTestDir(tmp_dir: []const u8) void {
+    Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
+}
+
+fn openTestWal(tmp_dir: []const u8, mode: Io.Dir.OpenFileOptions.Mode) !Io.File {
+    const path = try Io.Dir.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
+    defer std.testing.allocator.free(path);
+    return Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = mode });
+}
+
 test "write and read back WAL entries" {
     const tmp_dir = "/tmp/wal_replay_test_rw";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
+        var writer = try wal.WalWriter.init(std.testing.io, std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
 
         _ = try writer.append(test_op, "category-one");
@@ -175,7 +189,7 @@ test "write and read back WAL entries" {
     }
 
     {
-        var reader = (try WalReader.init(tmp_dir)).?;
+        var reader = (try WalReader.init(std.testing.io, tmp_dir)).?;
         defer reader.close();
 
         const e1 = (try reader.next()).?;
@@ -199,18 +213,17 @@ test "write and read back WAL entries" {
 }
 
 test "reader returns null for nonexistent WAL" {
-    const reader = try WalReader.init("/tmp/wal_replay_nonexistent_dir_12345");
+    const reader = try WalReader.init(std.testing.io, "/tmp/wal_replay_nonexistent_dir_12345");
     try std.testing.expect(reader == null);
 }
 
 test "replay with min_sequence filter" {
     const tmp_dir = "/tmp/wal_replay_test_filter";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
+        var writer = try wal.WalWriter.init(std.testing.io, std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
 
         _ = try writer.append(test_op, "first");
@@ -230,19 +243,18 @@ test "replay with min_sequence filter" {
     };
 
     var collector = Collector{};
-    const last_seq = try replayWal(tmp_dir, 2, &collector);
+    const last_seq = try replayWal(std.testing.io, tmp_dir, 2, &collector);
     try std.testing.expectEqual(@as(u64, 4), last_seq);
     try std.testing.expectEqual(@as(usize, 2), collector.count);
 }
 
 test "corrupted entry stops replay" {
     const tmp_dir = "/tmp/wal_replay_test_corrupt";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
+        var writer = try wal.WalWriter.init(std.testing.io, std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
 
         _ = try writer.append(test_op, "valid-entry");
@@ -250,14 +262,10 @@ test "corrupted entry stops replay" {
     }
 
     {
-        const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
-        defer std.testing.allocator.free(path);
+        const file = try openTestWal(tmp_dir, .read_write);
+        defer file.close(std.testing.io);
 
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer file.close();
-
-        const end = try file.getEndPos();
-        try file.seekTo(end);
+        const end = try file.length(std.testing.io);
 
         const bad_header = wal.WalEntryHeader{
             .sequence = 99,
@@ -266,12 +274,12 @@ test "corrupted entry stops replay" {
             .checksum = 0xDEADBEEF,
         };
         const header_bytes: *const [wal.HEADER_SIZE]u8 = @ptrCast(&bad_header);
-        try file.writeAll(header_bytes);
-        try file.writeAll("hello");
+        try file.writePositionalAll(std.testing.io, header_bytes, end);
+        try file.writePositionalAll(std.testing.io, "hello", end + wal.HEADER_SIZE);
     }
 
     {
-        var reader = (try WalReader.init(tmp_dir)).?;
+        var reader = (try WalReader.init(std.testing.io, tmp_dir)).?;
         defer reader.close();
 
         const e1 = (try reader.next()).?;
@@ -296,29 +304,27 @@ const TestCollector = struct {
 
 test "wal_replay: empty WAL replays cleanly" {
     const tmp_dir = "/tmp/wal_replay_test_empty";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
+    const path = try Io.Dir.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
     defer std.testing.allocator.free(path);
-    const f = try std.fs.cwd().createFile(path, .{});
-    f.close();
+    const f = try Io.Dir.cwd().createFile(std.testing.io, path, .{});
+    f.close(std.testing.io);
 
     var collector = TestCollector{};
-    const last = try replayWal(tmp_dir, 0, &collector);
+    const last = try replayWal(std.testing.io, tmp_dir, 0, &collector);
     try std.testing.expectEqual(@as(u64, 0), last);
     try std.testing.expectEqual(@as(usize, 0), collector.count);
 }
 
 test "wal_replay: single entry replays once with correct payload" {
     const tmp_dir = "/tmp/wal_replay_test_single";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
+        var writer = try wal.WalWriter.init(std.testing.io, std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         _ = try writer.append(test_op, "only-entry");
         try writer.sync();
@@ -336,7 +342,7 @@ test "wal_replay: single entry replays once with correct payload" {
         }
     };
     var cap = Capture{};
-    const last = try replayWal(tmp_dir, 0, &cap);
+    const last = try replayWal(std.testing.io, tmp_dir, 0, &cap);
     try std.testing.expectEqual(@as(u64, 1), last);
     try std.testing.expectEqual(@as(u64, 1), cap.seen_seq);
     try std.testing.expectEqualSlices(u8, "only-entry", cap.seen_data[0..cap.seen_data_len]);
@@ -344,12 +350,11 @@ test "wal_replay: single entry replays once with correct payload" {
 
 test "wal_replay: multi-entry replay preserves sequence order" {
     const tmp_dir = "/tmp/wal_replay_test_multi";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
+        var writer = try wal.WalWriter.init(std.testing.io, std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         var buf: [16]u8 = undefined;
         for (0..50) |i| {
@@ -360,7 +365,7 @@ test "wal_replay: multi-entry replay preserves sequence order" {
     }
 
     var collector = TestCollector{};
-    const last = try replayWal(tmp_dir, 0, &collector);
+    const last = try replayWal(std.testing.io, tmp_dir, 0, &collector);
     try std.testing.expectEqual(@as(u64, 50), last);
     try std.testing.expectEqual(@as(usize, 50), collector.count);
     for (collector.seqs[0..collector.count], 0..) |seq, i| {
@@ -370,12 +375,11 @@ test "wal_replay: multi-entry replay preserves sequence order" {
 
 test "wal_replay: torn tail discards partial entry without error" {
     const tmp_dir = "/tmp/wal_replay_test_torntail";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
+        var writer = try wal.WalWriter.init(std.testing.io, std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         for (0..10) |i| {
             var buf: [16]u8 = undefined;
@@ -386,27 +390,24 @@ test "wal_replay: torn tail discards partial entry without error" {
     }
 
     {
-        const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
-        defer std.testing.allocator.free(path);
-        const f = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer f.close();
-        try f.setEndPos(9 * 29 + 5);
+        const f = try openTestWal(tmp_dir, .read_write);
+        defer f.close(std.testing.io);
+        try f.setLength(std.testing.io, 9 * 29 + 5);
     }
 
     var collector = TestCollector{};
-    const last = try replayWal(tmp_dir, 0, &collector);
+    const last = try replayWal(std.testing.io, tmp_dir, 0, &collector);
     try std.testing.expectEqual(@as(usize, 9), collector.count);
     try std.testing.expectEqual(@as(u64, 9), last);
 }
 
 test "wal_replay: idempotent on second pass" {
     const tmp_dir = "/tmp/wal_replay_test_idem";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
-        var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32, 0, true);
+        var writer = try wal.WalWriter.init(std.testing.io, std.testing.allocator, tmp_dir, 32, 0, true);
         defer writer.deinit();
         _ = try writer.append(test_op, "first");
         _ = try writer.append(test_op, "second");
@@ -415,9 +416,9 @@ test "wal_replay: idempotent on second pass" {
     }
 
     var c1 = TestCollector{};
-    _ = try replayWal(tmp_dir, 0, &c1);
+    _ = try replayWal(std.testing.io, tmp_dir, 0, &c1);
     var c2 = TestCollector{};
-    _ = try replayWal(tmp_dir, 0, &c2);
+    _ = try replayWal(std.testing.io, tmp_dir, 0, &c2);
 
     try std.testing.expectEqual(c1.count, c2.count);
     for (c1.seqs[0..c1.count], c2.seqs[0..c2.count]) |a, b| {
@@ -427,14 +428,13 @@ test "wal_replay: idempotent on second pass" {
 
 test "wal_replay: oversized entry terminates replay cleanly" {
     const tmp_dir = "/tmp/wal_replay_test_toolarge";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
+    const path = try Io.Dir.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
     defer std.testing.allocator.free(path);
-    const f = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer f.close();
+    const f = try Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+    defer f.close(std.testing.io);
 
     const bogus_header = wal.WalEntryHeader{
         .sequence = 1,
@@ -443,9 +443,9 @@ test "wal_replay: oversized entry terminates replay cleanly" {
         .checksum = 0,
     };
     const header_bytes: *const [wal.HEADER_SIZE]u8 = @ptrCast(&bogus_header);
-    try f.writeAll(header_bytes);
+    try f.writePositionalAll(std.testing.io, header_bytes, 0);
 
-    var reader = (try WalReader.init(tmp_dir)).?;
+    var reader = (try WalReader.init(std.testing.io, tmp_dir)).?;
     defer reader.close();
     try std.testing.expectEqual(@as(?ReplayEntry, null), try reader.next());
 }
@@ -457,19 +457,22 @@ const FuzzNoopApplier = struct {
     }
 };
 
-fn fuzzWalReaderOne(_: void, input: []const u8) anyerror!void {
+fn fuzzWalReaderOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [4096]u8 = undefined;
+    const input = input_buf[0..smith.slice(&input_buf)];
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
-        const f = try tmp.dir.createFile("wal.bin", .{});
-        defer f.close();
-        try f.writeAll(input);
+        const f = try tmp.dir.createFile(std.testing.io, "wal.bin", .{});
+        defer f.close(std.testing.io);
+        try f.writePositionalAll(std.testing.io, input, 0);
     }
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     var applier = FuzzNoopApplier{};
-    _ = replayWal(dir_path, 0, &applier) catch {};
+    _ = replayWal(std.testing.io, dir_path, 0, &applier) catch {};
 }
 
 test "fuzz: WAL reader tolerates arbitrary file bytes" {

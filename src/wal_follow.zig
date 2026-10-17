@@ -6,7 +6,8 @@
 //! tails until the writer settles them.
 
 const std = @import("std");
-const posix = std.posix;
+const Io = std.Io;
+const sys = @import("sys.zig");
 const wal = @import("wal.zig");
 
 const BLOCK_SIZE: u64 = 4096;
@@ -29,9 +30,10 @@ pub const FollowedEntry = struct {
 /// the reader never reads past that boundary, so it only ever observes bytes
 /// the writer has already fsynced.
 pub const FollowReader = struct {
+    io: Io,
     allocator: std.mem.Allocator,
     path: []const u8,
-    file: ?std.fs.File,
+    file: ?Io.File,
     offset: u64,
     truncation_epoch: u64,
     after_lsn: u64,
@@ -42,9 +44,10 @@ pub const FollowReader = struct {
 
     /// Creates a follower that emits entries with `sequence > after_lsn`.
     /// The WAL file may not exist yet; `next` returns null until it does.
-    pub fn init(allocator: std.mem.Allocator, dir: []const u8, after_lsn: u64) !FollowReader {
-        const path = try std.fs.path.join(allocator, &.{ dir, "wal.bin" });
+    pub fn init(io: Io, allocator: std.mem.Allocator, dir: []const u8, after_lsn: u64) !FollowReader {
+        const path = try Io.Dir.path.join(allocator, &.{ dir, "wal.bin" });
         return FollowReader{
+            .io = io,
             .allocator = allocator,
             .path = path,
             .file = null,
@@ -52,7 +55,7 @@ pub const FollowReader = struct {
             .truncation_epoch = 0,
             .after_lsn = after_lsn,
             .last_sequence = after_lsn,
-            .data_buf = .{},
+            .data_buf = .empty,
             .stall_offset = 0,
             .stall_count = 0,
         };
@@ -60,7 +63,7 @@ pub const FollowReader = struct {
 
     /// Releases the file handle and buffers.
     pub fn deinit(self: *FollowReader) void {
-        if (self.file) |f| f.close();
+        if (self.file) |f| f.close(self.io);
         self.data_buf.deinit(self.allocator);
         self.allocator.free(self.path);
     }
@@ -86,7 +89,7 @@ pub const FollowReader = struct {
 
         while (self.offset + wal.HEADER_SIZE <= boundary.offset) {
             const probe_cap: usize = @intCast(@min(@as(u64, probe.len), boundary.offset - self.offset));
-            const pn = try file.preadAll(probe[0..probe_cap], self.offset);
+            const pn = try sys.preadAll(file.handle, probe[0..probe_cap], self.offset);
             if (pn < wal.HEADER_SIZE) return self.stall(file, boundary);
 
             const header = std.mem.bytesToValue(wal.WalEntryHeader, probe[0..wal.HEADER_SIZE]);
@@ -105,7 +108,7 @@ pub const FollowReader = struct {
             if (inline_end <= pn) {
                 @memcpy(self.data_buf.items, probe[wal.HEADER_SIZE..inline_end]);
             } else {
-                const dn = try file.preadAll(self.data_buf.items, self.offset + wal.HEADER_SIZE);
+                const dn = try sys.preadAll(file.handle, self.data_buf.items, self.offset + wal.HEADER_SIZE);
                 if (dn < header.data_len) return self.stall(file, boundary);
             }
 
@@ -141,7 +144,7 @@ pub const FollowReader = struct {
         var pos: u64 = 0;
         while (pos + wal.HEADER_SIZE <= boundary.offset) {
             var header_buf: [wal.HEADER_SIZE]u8 = undefined;
-            const hn = try file.preadAll(&header_buf, pos);
+            const hn = try sys.preadAll(file.handle, &header_buf, pos);
             if (hn < wal.HEADER_SIZE) return null;
 
             const header = std.mem.bytesToValue(wal.WalEntryHeader, &header_buf);
@@ -158,9 +161,9 @@ pub const FollowReader = struct {
         return null;
     }
 
-    fn ensureFile(self: *FollowReader) !?std.fs.File {
+    fn ensureFile(self: *FollowReader) !?Io.File {
         if (self.file) |f| return f;
-        const opened = std.fs.cwd().openFile(self.path, .{ .mode = .read_only }) catch |err| switch (err) {
+        const opened = Io.Dir.cwd().openFile(self.io, self.path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -168,7 +171,7 @@ pub const FollowReader = struct {
         return opened;
     }
 
-    fn stall(self: *FollowReader, file: std.fs.File, boundary: wal.DurableBoundary) !?FollowedEntry {
+    fn stall(self: *FollowReader, file: Io.File, boundary: wal.DurableBoundary) !?FollowedEntry {
         if (self.stall_offset == self.offset) {
             self.stall_count += 1;
             if (self.stall_count >= MAX_STALLS_AT_SAME_OFFSET) return error.InconsistentWal;
@@ -181,13 +184,13 @@ pub const FollowReader = struct {
         return null;
     }
 
-    fn dropPageCache(file: std.fs.File, from: u64, to: u64) void {
+    fn dropPageCache(file: Io.File, from: u64, to: u64) void {
         if (to <= from) return;
         _ = std.os.linux.fadvise(
             file.handle,
             @intCast(from),
             @intCast(to - from),
-            posix.POSIX_FADV.DONTNEED,
+            std.os.linux.POSIX_FADV.DONTNEED,
         );
     }
 };
@@ -196,7 +199,7 @@ const test_op: u8 = 100;
 
 fn initWriter(dir: []const u8) !*wal.WalWriter {
     const w = try std.testing.allocator.create(wal.WalWriter);
-    w.* = try wal.WalWriter.init(std.testing.allocator, dir, 32, 0, true);
+    w.* = try wal.WalWriter.init(std.testing.io, std.testing.allocator, dir, 32, 0, true);
     try w.startFlusher();
     return w;
 }
@@ -206,16 +209,24 @@ fn deinitWriter(w: *wal.WalWriter) void {
     std.testing.allocator.destroy(w);
 }
 
+fn resetTestDir(tmp_dir: []const u8) void {
+    Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
+    Io.Dir.createDirAbsolute(std.testing.io, tmp_dir, .default_dir) catch {};
+}
+
+fn removeTestDir(tmp_dir: []const u8) void {
+    Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
+}
+
 test "follow reader yields entries appended and synced after open" {
     const tmp_dir = "/tmp/wal_follow_test_basic";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initWriter(tmp_dir);
     defer deinitWriter(writer);
 
-    var reader = try FollowReader.init(std.testing.allocator, tmp_dir, 0);
+    var reader = try FollowReader.init(std.testing.io, std.testing.allocator, tmp_dir, 0);
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(?FollowedEntry, null), try reader.next(writer.durableBoundary()));
@@ -246,9 +257,8 @@ test "follow reader yields entries appended and synced after open" {
 
 test "follow reader respects a stale durable boundary" {
     const tmp_dir = "/tmp/wal_follow_test_stale_boundary";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initWriter(tmp_dir);
     defer deinitWriter(writer);
@@ -261,7 +271,7 @@ test "follow reader respects a stale durable boundary" {
     _ = try writer.append(test_op, "three");
     try writer.sync();
 
-    var reader = try FollowReader.init(std.testing.allocator, tmp_dir, 0);
+    var reader = try FollowReader.init(std.testing.io, std.testing.allocator, tmp_dir, 0);
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(u64, 1), (try reader.next(stale)).?.sequence);
@@ -274,14 +284,13 @@ test "follow reader respects a stale durable boundary" {
 
 test "follow reader continues across a checkpoint truncation via the epoch rewind" {
     const tmp_dir = "/tmp/wal_follow_test_truncate";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initWriter(tmp_dir);
     defer deinitWriter(writer);
 
-    var reader = try FollowReader.init(std.testing.allocator, tmp_dir, 0);
+    var reader = try FollowReader.init(std.testing.io, std.testing.allocator, tmp_dir, 0);
     defer reader.deinit();
 
     _ = try writer.append(test_op, "pre-1");
@@ -303,9 +312,8 @@ test "follow reader continues across a checkpoint truncation via the epoch rewin
 
 test "follow reader skips entries at or below after_lsn" {
     const tmp_dir = "/tmp/wal_follow_test_after_lsn";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initWriter(tmp_dir);
     defer deinitWriter(writer);
@@ -315,7 +323,7 @@ test "follow reader skips entries at or below after_lsn" {
     _ = try writer.append(test_op, "three");
     try writer.sync();
 
-    var reader = try FollowReader.init(std.testing.allocator, tmp_dir, 2);
+    var reader = try FollowReader.init(std.testing.io, std.testing.allocator, tmp_dir, 2);
     defer reader.deinit();
 
     const boundary = writer.durableBoundary();
@@ -326,9 +334,8 @@ test "follow reader skips entries at or below after_lsn" {
 
 test "follow reader surfaces a sequence gap when the file starts past the requested LSN" {
     const tmp_dir = "/tmp/wal_follow_test_gap";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initWriter(tmp_dir);
     defer deinitWriter(writer);
@@ -341,7 +348,7 @@ test "follow reader surfaces a sequence gap when the file starts past the reques
     _ = try writer.append(test_op, "three");
     try writer.sync();
 
-    var reader = try FollowReader.init(std.testing.allocator, tmp_dir, 0);
+    var reader = try FollowReader.init(std.testing.io, std.testing.allocator, tmp_dir, 0);
     defer reader.deinit();
 
     try std.testing.expectError(error.WalSequenceGap, reader.next(writer.durableBoundary()));
@@ -349,14 +356,13 @@ test "follow reader surfaces a sequence gap when the file starts past the reques
 
 test "firstSequence probes the first entry in the file" {
     const tmp_dir = "/tmp/wal_follow_test_first_seq";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initWriter(tmp_dir);
     defer deinitWriter(writer);
 
-    var reader = try FollowReader.init(std.testing.allocator, tmp_dir, 0);
+    var reader = try FollowReader.init(std.testing.io, std.testing.allocator, tmp_dir, 0);
     defer reader.deinit();
 
     try std.testing.expectEqual(@as(?u64, null), try reader.firstSequence(writer.durableBoundary()));

@@ -66,25 +66,33 @@ fn addLink(store: *Store, category_id: u64, title: []const u8) !u64 {
     return id;
 }
 
-fn openStore(allocator: std.mem.Allocator, data_dir: []const u8) !*Store {
-    return Store.init(allocator, .{ .data_dir = data_dir });
+fn openStore(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) !*Store {
+    return Store.init(io, allocator, .{ .data_dir = data_dir });
 }
 
 fn closeStore(store: *Store) void {
     store.deinit();
 }
 
+const example_dir = ".zig-cache/zigstore-example";
+
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const data_dir = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(data_dir);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    const store = try openStore(allocator, data_dir);
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+    const data_dir = try std.Io.Dir.path.join(allocator, &.{ cwd_path, example_dir });
+    defer allocator.free(data_dir);
+    try std.Io.Dir.cwd().createDirPath(io, data_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
+
+    const store = try openStore(io, allocator, data_dir);
     defer closeStore(store);
 
     const arts = try addCategory(store, 0, "Arts");
@@ -140,10 +148,10 @@ test "example builds and drives the paged store without leaks" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const data_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const data_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(data_dir);
 
-    const store = try openStore(allocator, data_dir);
+    const store = try openStore(std.testing.io, allocator, data_dir);
     defer closeStore(store);
 
     const arts = try addCategory(store, 0, "Arts");

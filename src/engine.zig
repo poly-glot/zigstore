@@ -13,6 +13,7 @@
 //! background maintenance runs through the generic `spawnWorker` seam.
 
 const std = @import("std");
+const Io = std.Io;
 const codec = @import("codec.zig");
 const page = @import("page.zig");
 const file_header = @import("file_header.zig");
@@ -24,6 +25,7 @@ const wal_replay = @import("wal_replay.zig");
 const snapshot = @import("snapshot.zig");
 const replication = @import("replication.zig");
 const commit = @import("commit.zig");
+const TimedCondition = @import("timed_condition.zig").TimedCondition;
 
 /// The paged B+Tree backing one index (point ops + range scans over byte keys/values).
 pub const BPlusTree = @import("btree/btree.zig").BPlusTree;
@@ -127,14 +129,22 @@ fn indexOfName(comptime indexes: []const IndexSpec, comptime name: []const u8) ?
     return null;
 }
 
-fn structField(comptime name: [:0]const u8, comptime T: type) std.builtin.Type.StructField {
-    return .{
-        .name = name,
-        .type = T,
-        .default_value_ptr = null,
-        .is_comptime = false,
-        .alignment = @alignOf(T),
-    };
+const FieldSpec = struct { name: []const u8, type: type };
+
+fn structField(comptime name: []const u8, comptime T: type) FieldSpec {
+    return .{ .name = name, .type = T };
+}
+
+fn StructOf(comptime layout: std.builtin.Type.ContainerLayout, comptime fields: []const FieldSpec) type {
+    var names: [fields.len][]const u8 = undefined;
+    var types: [fields.len]type = undefined;
+    for (fields, 0..) |f, i| {
+        names[i] = f.name;
+        types[i] = f.type;
+    }
+    const frozen_names = names;
+    const frozen_types = types;
+    return @Struct(layout, null, &frozen_names, &frozen_types, &@splat(.{}));
 }
 
 fn headerPrefixSize(comptime s: Schema) usize {
@@ -150,7 +160,7 @@ fn HeaderType(comptime s: Schema) type {
     comptime {
         if (headerPrefixSize(s) > page.PAGE_SIZE) @compileError("zigstore schema: header (indexes+counters) exceeds PAGE_SIZE; reduce indexes/counters");
         const reserved_len = page.PAGE_SIZE - headerPrefixSize(s);
-        const generic = [_]std.builtin.Type.StructField{
+        const generic = [_]FieldSpec{
             structField("magic", u32),
             structField("format_version", u32),
             structField("page_size", u32),
@@ -160,7 +170,7 @@ fn HeaderType(comptime s: Schema) type {
             structField("seq", u64),
         };
 
-        var fields: [generic.len + s.indexes.len * 2 + s.counters.len + 1]std.builtin.Type.StructField = undefined;
+        var fields: [generic.len + s.indexes.len * 2 + s.counters.len + 1]FieldSpec = undefined;
         var n: usize = 0;
         for (generic) |f| {
             fields[n] = f;
@@ -179,52 +189,38 @@ fn HeaderType(comptime s: Schema) type {
         fields[n] = structField("_reserved", [reserved_len]u8);
         n += 1;
 
-        return @Type(.{ .@"struct" = .{
-            .layout = .@"extern",
-            .fields = fields[0..n],
-            .decls = &.{},
-            .is_tuple = false,
-        } });
+        return StructOf(.@"extern", fields[0..n]);
     }
 }
 
 fn TreesType(comptime s: Schema) type {
     comptime {
-        var fields: [s.indexes.len]std.builtin.Type.StructField = undefined;
+        var fields: [s.indexes.len]FieldSpec = undefined;
         for (s.indexes, 0..) |idx, i| {
             fields[i] = structField(idx.name, BPlusTree);
         }
-        return @Type(.{ .@"struct" = .{
-            .layout = .auto,
-            .fields = &fields,
-            .decls = &.{},
-            .is_tuple = false,
-        } });
+        return StructOf(.auto, &fields);
     }
 }
 
 fn MemtablesType(comptime s: Schema) type {
     comptime {
-        var fields: [s.memtable_indexes.len]std.builtin.Type.StructField = undefined;
+        var fields: [s.memtable_indexes.len]FieldSpec = undefined;
         for (s.memtable_indexes, 0..) |name, i| {
             fields[i] = structField(name, MemTable);
         }
-        return @Type(.{ .@"struct" = .{
-            .layout = .auto,
-            .fields = &fields,
-            .decls = &.{},
-            .is_tuple = false,
-        } });
+        return StructOf(.auto, &fields);
     }
 }
 
 /// A generic background worker spawned by `Store.spawnWorker`: a thread that fires the
 /// supplied `tick` on a fixed interval until `stop` joins it cleanly.
 pub const Worker = struct {
+    io: Io,
     thread: std.Thread,
     shutdown: std.atomic.Value(bool),
-    cond: std.Thread.Condition,
-    mutex: std.Thread.Mutex,
+    cond: TimedCondition,
+    mutex: Io.Mutex,
     interval_ns: u64,
     ctx: *anyopaque,
     tick: *const fn (ctx: *anyopaque) anyerror!void,
@@ -233,22 +229,22 @@ pub const Worker = struct {
     /// Signal the worker to stop, wait for the current tick to finish, join the thread, and
     /// free the worker. Safe to call exactly once.
     pub fn stop(self: *Worker) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.shutdown.store(true, .release);
-        self.cond.signal();
-        self.mutex.unlock();
+        self.cond.signal(self.io);
+        self.mutex.unlock(self.io);
         self.thread.join();
         self.allocator.destroy(self);
     }
 
     fn loop(self: *Worker) void {
         while (true) {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             if (!self.shutdown.load(.acquire)) {
-                self.cond.timedWait(&self.mutex, self.interval_ns) catch {};
+                self.cond.timedWait(self.io, &self.mutex, self.interval_ns);
             }
             const stopping = self.shutdown.load(.acquire);
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
 
             if (stopping) break;
             self.tick(self.ctx) catch |err| {
@@ -303,10 +299,11 @@ pub fn Engine(comptime s: Schema) type {
         const Trees = TreesType(s);
         const Memtables = MemtablesType(s);
 
+        io: Io,
         allocator: std.mem.Allocator,
         config: Config,
-        file: std.fs.File,
-        journal: std.fs.File,
+        file: Io.File,
+        journal: Io.File,
         header: Header,
         cache: page_cache.PageCache,
         free_list: freelist.FreeList,
@@ -317,12 +314,12 @@ pub fn Engine(comptime s: Schema) type {
 
         was_empty: bool,
 
-        mt_drain_mutex: std.Thread.Mutex,
+        mt_drain_mutex: Io.Mutex,
 
-        header_lock: std.Thread.Mutex,
+        header_lock: Io.Mutex,
 
-        apply_mutex: std.Thread.Mutex,
-        apply_cond: std.Thread.Condition,
+        apply_mutex: Io.Mutex,
+        apply_cond: Io.Condition,
         last_applied_seq: u64,
         snapshot_in_progress: std.atomic.Value(bool),
 
@@ -334,8 +331,9 @@ pub fn Engine(comptime s: Schema) type {
         checkpoint_interval_s: u32,
         last_checkpoint_time: i64,
 
-        /// Open (or create) the store under `config.data_dir`, returning a heap-allocated
-        /// `*Store` at a stable address. A complete `checkpoint.journal` left by a crash is
+        /// Open (or create) the store under `config.data_dir` on `io`, returning a heap-allocated
+        /// `*Store` at a stable address. `io` runs the store's locks and cold-path file
+        /// operations; the WAL, page, and reactor I/O stay on raw syscalls. A complete `checkpoint.journal` left by a crash is
         /// redone into `store.dat` first (an incomplete one is discarded); the journal then
         /// stays open, empty, for the store's checkpoints. On a fresh directory
         /// the header is formatted with the schema's identity and every index starts at an
@@ -346,8 +344,8 @@ pub fn Engine(comptime s: Schema) type {
         /// `cache`/`free_list` and the free list's `cache` are bound to the settled in-place
         /// pointers and the WAL flusher is started before returning, so the value never needs
         /// an external rebind. Release it with `deinit`.
-        pub fn init(allocator: std.mem.Allocator, config: Config) !*Store {
-            std.fs.makeDirAbsolute(config.data_dir) catch |err| switch (err) {
+        pub fn init(io: Io, allocator: std.mem.Allocator, config: Config) !*Store {
+            Io.Dir.createDirAbsolute(io, config.data_dir, .default_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
             };
@@ -355,13 +353,13 @@ pub fn Engine(comptime s: Schema) type {
             const path = try std.fmt.allocPrint(allocator, "{s}/store.dat", .{config.data_dir});
             defer allocator.free(path);
 
-            const file = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = false });
-            errdefer file.close();
+            const file = try Io.Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = false });
+            errdefer file.close(io);
 
-            const journal = try openJournal(allocator, config.data_dir, file);
-            errdefer journal.close();
+            const journal = try openJournal(io, allocator, config.data_dir, file);
+            errdefer journal.close(io);
 
-            const file_size = (try file.stat()).size;
+            const file_size = (try file.stat(io)).size;
             const is_new = file_size == 0;
 
             var header: Header = undefined;
@@ -376,61 +374,61 @@ pub fn Engine(comptime s: Schema) type {
                 }
 
                 const header_bytes = file_header.serialize(header);
-                try file.seekTo(0);
-                try file.writeAll(&header_bytes);
-                try file.sync();
+                try file.writePositionalAll(io, &header_bytes, 0);
+                try file.sync(io);
             } else {
-                try file.seekTo(0);
                 var header_buf: [page.PAGE_SIZE]u8 = undefined;
-                const bytes_read = try file.readAll(&header_buf);
+                const bytes_read = try file.readPositionalAll(io, &header_buf, 0);
                 if (bytes_read < @sizeOf(Header)) return error.UnexpectedEof;
                 header = file_header.deserialize(Header, &header_buf);
                 try file_header.validate(header, s.magic, s.format_version);
             }
 
             const cache_pages = (config.cache_size_mb * 1024 * 1024) / page.PAGE_SIZE;
-            var cache = try page_cache.PageCache.init(allocator, file, cache_pages);
+            var cache = try page_cache.PageCache.init(io, allocator, file, cache_pages);
             errdefer cache.deinit();
 
-            const snapshot_base = snapshot.SnapshotManager.getWalSequence(config.data_dir) catch |err| blk: {
+            const snapshot_base = snapshot.SnapshotManager.getWalSequence(io, config.data_dir) catch |err| blk: {
                 log.warn("snapshot meta read failed: {} — WAL sequence resumes from 0", .{err});
                 break :blk 0;
             };
             const wal_base = @max(header.seq, snapshot_base);
-            var wal_writer: ?wal.WalWriter = try wal.WalWriter.init(allocator, config.data_dir, config.wal_batch_size, wal_base, config.wal_direct_io);
+            var wal_writer: ?wal.WalWriter = try wal.WalWriter.init(io, allocator, config.data_dir, config.wal_batch_size, wal_base, config.wal_direct_io);
             errdefer if (wal_writer) |*w| w.deinit();
 
             const self = try allocator.create(Store);
             errdefer allocator.destroy(self);
 
             self.* = Store{
+                .io = io,
                 .allocator = allocator,
                 .config = config,
                 .file = file,
                 .journal = journal,
                 .header = header,
                 .cache = cache,
-                .free_list = .{ .head = @intCast(header.free_list_head), .cache = undefined, .mutex = .{} },
+                .free_list = .{ .io = io, .head = @intCast(header.free_list_head), .cache = undefined, .mutex = .init },
                 .wal_writer = wal_writer,
                 .trees = undefined,
                 .memtables = undefined,
                 .was_empty = is_new,
-                .mt_drain_mutex = .{},
-                .header_lock = .{},
-                .apply_mutex = .{},
-                .apply_cond = .{},
+                .mt_drain_mutex = .init,
+                .header_lock = .init,
+                .apply_mutex = .init,
+                .apply_cond = .init,
                 .last_applied_seq = if (wal_writer) |w| w.sequence else 0,
                 .snapshot_in_progress = std.atomic.Value(bool).init(false),
                 .read_only = std.atomic.Value(bool).init(false),
                 .replica_streaming = std.atomic.Value(bool).init(false),
                 .commit_gate = std.atomic.Value(?*replication.CommitGate).init(null),
-                .sync_gate = .{},
+                .sync_gate = .{ .io = io },
                 .checkpoint_interval_s = 0,
                 .last_checkpoint_time = 0,
             };
 
             inline for (s.indexes) |idx| {
                 @field(self.trees, idx.name) = BPlusTree.init(
+                    io,
                     undefined,
                     undefined,
                     @intCast(@field(header, idx.name ++ "_root")),
@@ -439,7 +437,7 @@ pub fn Engine(comptime s: Schema) type {
             }
 
             inline for (s.memtable_indexes) |name| {
-                @field(self.memtables, name) = MemTable.init(allocator);
+                @field(self.memtables, name) = MemTable.init(io, allocator);
             }
             errdefer inline for (s.memtable_indexes) |name| {
                 @field(self.memtables, name).deinit();
@@ -474,8 +472,8 @@ pub fn Engine(comptime s: Schema) type {
                 @field(self.memtables, name).deinit();
             }
             self.cache.deinit();
-            self.journal.close();
-            self.file.close();
+            self.journal.close(self.io);
+            self.file.close(self.io);
 
             const allocator = self.allocator;
             allocator.destroy(self);
@@ -521,8 +519,8 @@ pub fn Engine(comptime s: Schema) type {
         /// midway leaves the undrained rows in the memtable's back buffer; the next drain merges
         /// and retries them.
         pub fn drainMemtables(self: *Store) !void {
-            self.mt_drain_mutex.lock();
-            defer self.mt_drain_mutex.unlock();
+            self.mt_drain_mutex.lockUncancelable(self.io);
+            defer self.mt_drain_mutex.unlock(self.io);
             try self.drainMemtablesLocked(false);
         }
 
@@ -530,8 +528,8 @@ pub fn Engine(comptime s: Schema) type {
         /// between rows exactly as `drainMemtables` does. For a consumer that needs a single
         /// index settled before a tree scan; the caller must not hold any engine lock.
         pub fn drainMemtableInto(self: *Store, mt: *MemTable, dst: *BPlusTree) !void {
-            self.mt_drain_mutex.lock();
-            defer self.mt_drain_mutex.unlock();
+            self.mt_drain_mutex.lockUncancelable(self.io);
+            defer self.mt_drain_mutex.unlock(self.io);
             try self.drainOne(mt, dst, false);
         }
 
@@ -573,8 +571,8 @@ pub fn Engine(comptime s: Schema) type {
 
         fn relieveDrainPressure(self: *Store, apply_held: bool) !void {
             if (!self.cache.dirtyPressureHigh()) return;
-            if (!apply_held) self.apply_mutex.lock();
-            defer if (!apply_held) self.apply_mutex.unlock();
+            if (!apply_held) self.apply_mutex.lockUncancelable(self.io);
+            defer if (!apply_held) self.apply_mutex.unlock(self.io);
             try self.persistLocked(self.header.seq);
         }
 
@@ -583,10 +581,10 @@ pub fn Engine(comptime s: Schema) type {
         /// `header.seq` is unchanged. The pressure valve a `spawnCheckpointer` worker pulls when
         /// `cache.dirtyPressureHigh()`; takes `mt_drain_mutex` then `apply_mutex`.
         pub fn flushPages(self: *Store) !void {
-            self.mt_drain_mutex.lock();
-            defer self.mt_drain_mutex.unlock();
-            self.apply_mutex.lock();
-            defer self.apply_mutex.unlock();
+            self.mt_drain_mutex.lockUncancelable(self.io);
+            defer self.mt_drain_mutex.unlock(self.io);
+            self.apply_mutex.lockUncancelable(self.io);
+            defer self.apply_mutex.unlock(self.io);
             try self.persistLocked(self.header.seq);
         }
 
@@ -595,8 +593,8 @@ pub fn Engine(comptime s: Schema) type {
         /// engine lock; the commit path calls it before appending.
         pub fn relieveDirtyPressure(self: *Store) !void {
             if (!self.cache.dirtyPressureHigh()) return;
-            self.mt_drain_mutex.lock();
-            defer self.mt_drain_mutex.unlock();
+            self.mt_drain_mutex.lockUncancelable(self.io);
+            defer self.mt_drain_mutex.unlock(self.io);
             try self.relieveDrainPressure(false);
         }
 
@@ -604,10 +602,10 @@ pub fn Engine(comptime s: Schema) type {
         /// crash, and return the new `header.seq`. Takes `mt_drain_mutex` then `apply_mutex` and
         /// runs `checkpointLocked`.
         pub fn checkpoint(self: *Store) !u64 {
-            self.mt_drain_mutex.lock();
-            defer self.mt_drain_mutex.unlock();
-            self.apply_mutex.lock();
-            defer self.apply_mutex.unlock();
+            self.mt_drain_mutex.lockUncancelable(self.io);
+            defer self.mt_drain_mutex.unlock(self.io);
+            self.apply_mutex.lockUncancelable(self.io);
+            defer self.apply_mutex.unlock(self.io);
             return self.checkpointLocked();
         }
 
@@ -629,7 +627,7 @@ pub fn Engine(comptime s: Schema) type {
         fn checkpointQuiesced(self: *Store, w: ?*wal.WalWriter) !u64 {
             if (w) |writer| {
                 while (self.last_applied_seq < writer.getSequence()) {
-                    self.apply_cond.wait(&self.apply_mutex);
+                    self.apply_cond.waitUncancelable(self.io, &self.apply_mutex);
                 }
             }
 
@@ -652,52 +650,52 @@ pub fn Engine(comptime s: Schema) type {
             const header_bytes = self.serializeHeaderLocked(durable_seq);
 
             try self.cache.checkpoint(self.journal, &header_bytes);
-            try self.journal.setEndPos(0);
+            try self.journal.setLength(self.io, 0);
         }
 
         fn serializeHeaderLocked(self: *Store, durable_seq: u64) [page.PAGE_SIZE]u8 {
-            self.header_lock.lock();
-            defer self.header_lock.unlock();
+            self.header_lock.lockUncancelable(self.io);
+            defer self.header_lock.unlock(self.io);
 
             inline for (s.indexes) |idx| {
                 @field(self.header, idx.name ++ "_root") = @field(self.trees, idx.name).getRootPage();
                 @field(self.header, idx.name ++ "_count") = @field(self.trees, idx.name).entryCount();
             }
             self.header.free_list_head = self.free_list.getHead();
-            self.cache.alloc_lock.lock();
+            self.cache.alloc_lock.lockUncancelable(self.io);
             self.header.page_count = self.cache.page_count;
-            self.cache.alloc_lock.unlock();
+            self.cache.alloc_lock.unlock(self.io);
             self.header.seq = durable_seq;
 
             return file_header.serialize(self.header);
         }
 
         fn journalPath(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-            return std.fs.path.join(allocator, &.{ data_dir, "checkpoint.journal" });
+            return Io.Dir.path.join(allocator, &.{ data_dir, "checkpoint.journal" });
         }
 
-        fn openJournal(allocator: std.mem.Allocator, data_dir: []const u8, file: std.fs.File) !std.fs.File {
+        fn openJournal(io: Io, allocator: std.mem.Allocator, data_dir: []const u8, file: Io.File) !Io.File {
             const journal_path = try journalPath(allocator, data_dir);
             defer allocator.free(journal_path);
 
-            const journal = std.fs.openFileAbsolute(journal_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            const journal = Io.Dir.openFileAbsolute(io, journal_path, .{ .mode = .read_write }) catch |err| switch (err) {
                 error.FileNotFound => {
-                    const created = try std.fs.createFileAbsolute(journal_path, .{ .read = true });
+                    const created = try Io.Dir.createFileAbsolute(io, journal_path, .{ .read = true });
                     snapshot.fsyncDir(data_dir);
                     return created;
                 },
                 else => return err,
             };
-            errdefer journal.close();
+            errdefer journal.close(io);
 
-            if ((try journal.getEndPos()) > 0) {
-                if (try page_cache.PageCache.redoJournal(journal, file)) {
+            if ((try journal.length(io)) > 0) {
+                if (try page_cache.PageCache.redoJournal(io, journal, file)) {
                     log.info("open: redid the checkpoint journal left by an interrupted checkpoint", .{});
                 } else {
                     log.warn("open: discarded an incomplete checkpoint journal", .{});
                 }
-                try journal.setEndPos(0);
-                try journal.sync();
+                try journal.setLength(io, 0);
+                try journal.sync(io);
             }
             return journal;
         }
@@ -708,7 +706,7 @@ pub fn Engine(comptime s: Schema) type {
         /// next tick retries. Stop it with `worker.stop()` before `deinit`.
         pub fn spawnCheckpointer(self: *Store, interval_s: u32) !*Worker {
             self.checkpoint_interval_s = interval_s;
-            self.last_checkpoint_time = std.time.timestamp();
+            self.last_checkpoint_time = Io.Clock.real.now(self.io).toSeconds();
             return self.spawnWorker(self, .{ .interval_ns = std.time.ns_per_s, .tick = checkpointerTick });
         }
 
@@ -716,7 +714,7 @@ pub fn Engine(comptime s: Schema) type {
             const self: *Store = @ptrCast(@alignCast(ctx));
             try self.relieveDirtyPressure();
 
-            const now = std.time.timestamp();
+            const now = Io.Clock.real.now(self.io).toSeconds();
             if (now - self.last_checkpoint_time < @as(i64, self.checkpoint_interval_s)) return;
             _ = try self.checkpoint();
             self.last_checkpoint_time = now;
@@ -736,7 +734,7 @@ pub fn Engine(comptime s: Schema) type {
             bootstrap: *const fn (ctx: *anyopaque) anyerror!void,
         }) !void {
             var applier = ReplayAdapter{ .store = self, .ctx = ctx, .apply_entry = hooks.apply_entry };
-            const last_seq = wal_replay.replayWal(self.config.data_dir, self.header.seq, &applier) catch |err| {
+            const last_seq = wal_replay.replayWal(self.io, self.config.data_dir, self.header.seq, &applier) catch |err| {
                 log.err("WAL replay failed: {}", .{err});
                 return err;
             };
@@ -768,10 +766,11 @@ pub fn Engine(comptime s: Schema) type {
             const worker = try self.allocator.create(Worker);
             errdefer self.allocator.destroy(worker);
             worker.* = .{
+                .io = self.io,
                 .thread = undefined,
                 .shutdown = std.atomic.Value(bool).init(false),
                 .cond = .{},
-                .mutex = .{},
+                .mutex = .init,
                 .interval_ns = cfg.interval_ns,
                 .ctx = ctx,
                 .tick = cfg.tick,
@@ -787,6 +786,7 @@ pub fn Engine(comptime s: Schema) type {
         /// `snapshot.forceSnapshot`.
         pub fn snapshotHost(self: *Store) snapshot.SnapshotHost {
             return .{
+                .io = self.io,
                 .snapshot_in_progress = &self.snapshot_in_progress,
                 .data_dir = self.config.data_dir,
                 .apply_mutex = &self.apply_mutex,
@@ -808,9 +808,9 @@ pub fn Engine(comptime s: Schema) type {
         /// flag, the last applied WAL sequence, and the last durable WAL sequence (0 when
         /// the store runs without a WAL). Cheap enough for a readiness probe path.
         pub fn healthStatus(self: *Store) HealthStatus {
-            self.apply_mutex.lock();
+            self.apply_mutex.lockUncancelable(self.io);
             const applied = self.last_applied_seq;
-            self.apply_mutex.unlock();
+            self.apply_mutex.unlock(self.io);
 
             return .{
                 .read_only = self.read_only.load(.acquire),
@@ -927,6 +927,7 @@ pub fn Engine(comptime s: Schema) type {
         ) !replication.ReplicaHost {
             if (self.wal_writer == null) return error.WalDisabled;
             return .{
+                .io = self.io,
                 .wal = &self.wal_writer.?,
                 .apply_mutex = &self.apply_mutex,
                 .apply_cond = &self.apply_cond,
@@ -990,16 +991,20 @@ const test_schema = schema(.{
 
 const TestStore = Engine(test_schema);
 
+fn tmpDirPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPathFile(std.testing.io, ".", &buf);
+    return allocator.dupe(u8, buf[0..len]);
+}
+
 fn openTestStore(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !*TestStore {
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
-    errdefer allocator.free(path);
-    return TestStore.init(allocator, .{ .data_dir = path, .cache_size_mb = 16 });
+    return openTestStoreSized(allocator, tmp, 16);
 }
 
 fn openTestStoreSized(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, cache_size_mb: u32) !*TestStore {
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmpDirPath(allocator, tmp);
     errdefer allocator.free(path);
-    return TestStore.init(allocator, .{ .data_dir = path, .cache_size_mb = cache_size_mb });
+    return TestStore.init(std.testing.io, allocator, .{ .data_dir = path, .cache_size_mb = cache_size_mb });
 }
 
 fn closeTestStore(store: *TestStore) void {
@@ -1015,8 +1020,8 @@ fn crashClose(store: *TestStore) void {
     if (store.wal_writer) |*w| w.deinit();
     inline for (test_schema.memtable_indexes) |name| store.memtable(name).deinit();
     store.cache.deinit();
-    store.journal.close();
-    store.file.close();
+    store.journal.close(std.testing.io);
+    store.file.close(std.testing.io);
     allocator.destroy(store);
     allocator.free(data_dir);
 }
@@ -1057,7 +1062,7 @@ fn expectKeyPresent(store: *TestStore, id: u64, present: bool) !void {
 
 fn walIsEmpty(dir: []const u8) !bool {
     var applier = CountingApplier{};
-    const last = try wal_replay.replayWal(dir, 0, &applier);
+    const last = try wal_replay.replayWal(std.testing.io, dir, 0, &applier);
     return last == 0 and applier.count == 0;
 }
 
@@ -1217,12 +1222,12 @@ test "recover: applies each WAL entry once, replays-hook once, bootstraps only w
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     {
         const op_code: u8 = 1;
-        var w = try wal.WalWriter.init(allocator, dir, 32, 0, true);
+        var w = try wal.WalWriter.init(std.testing.io, allocator, dir, 32, 0, true);
         defer w.deinit();
         _ = try w.append(op_code, "one");
         _ = try w.append(op_code, "two");
@@ -1403,15 +1408,15 @@ test "a checkpoint interrupted after its journal is durable completes on reopen"
         try std.testing.expectEqual(first_batch, try store.checkpoint());
 
         var pre_checkpoint_header: [page.PAGE_SIZE]u8 = undefined;
-        try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), try store.file.preadAll(&pre_checkpoint_header, 0));
+        try std.testing.expectEqual(@as(usize, page.PAGE_SIZE), try store.file.readPositionalAll(std.testing.io, &pre_checkpoint_header, 0));
 
         while (i <= total) : (i += 1) _ = try commitKey(store, i);
 
         const header_bytes = store.serializeHeaderLocked(store.wal_writer.?.getSequence());
         try store.cache.checkpoint(store.journal, &header_bytes);
 
-        try store.file.pwriteAll(&pre_checkpoint_header, 0);
-        try store.file.sync();
+        try store.file.writePositionalAll(std.testing.io, &pre_checkpoint_header, 0);
+        try store.file.sync(std.testing.io);
         crashClose(store);
     }
 
@@ -1422,7 +1427,7 @@ test "a checkpoint interrupted after its journal is durable completes on reopen"
         try std.testing.expectEqual(total, store.header.seq);
         var i: u64 = 1;
         while (i <= total) : (i += 1) try expectKeyPresent(store, i, true);
-        try std.testing.expectEqual(@as(u64, 0), try store.journal.getEndPos());
+        try std.testing.expectEqual(@as(u64, 0), try store.journal.length(std.testing.io));
     }
 }
 
@@ -1512,7 +1517,7 @@ test "recovery with a page cache smaller than the replayed data succeeds" {
     defer tmp.cleanup();
 
     const total: u64 = 20_000;
-    const value = [_]u8{'x'} ** 512;
+    const value: [512]u8 = @splat('x');
 
     {
         const store = try openTestStoreSized(allocator, &tmp, 8);
@@ -1556,7 +1561,7 @@ test "the WAL sequence resumes from header.seq after a checkpoint even without s
         try std.testing.expect(try walIsEmpty(store.config.data_dir));
     }
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("snapshot.meta", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "snapshot.meta", .{}));
 
     {
         const store = try openTestStore(allocator, &tmp);
@@ -1571,23 +1576,23 @@ test "a store whose WAL cannot open refuses to start" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makeDir("wal.bin");
+    try tmp.dir.createDir(std.testing.io, "wal.bin", .default_dir);
 
-    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(path);
 
-    try std.testing.expectError(error.IsDir, TestStore.init(allocator, .{ .data_dir = path, .cache_size_mb = 16 }));
+    try std.testing.expectError(error.IsDir, TestStore.init(std.testing.io, allocator, .{ .data_dir = path, .cache_size_mb = 16 }));
 }
 
 test "recover truncates the WAL after its post-replay checkpoint" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     {
-        var w = try wal.WalWriter.init(allocator, dir, 32, 0, true);
+        var w = try wal.WalWriter.init(std.testing.io, allocator, dir, 32, 0, true);
         defer w.deinit();
         var i: u64 = 1;
         while (i <= 5) : (i += 1) {

@@ -25,38 +25,38 @@ pub const ServerConfig = struct {
 
     const MAX_TRUSTED_IPS = 16;
 
-    /// Build a config from the environment, reading keys under `prefix` (e.g.
-    /// `"ZIGSTORE_"` reads `ZIGSTORE_PORT`). Falls back to the struct defaults
+    /// Build a config from the process environment map `env` (`std.process.Init.environ_map`),
+    /// reading keys under `prefix` (e.g. `"ZIGSTORE_"` reads `ZIGSTORE_PORT`). Falls back to the struct defaults
     /// on absent or unparseable values; a zero thread count resolves to the
     /// host CPU count, capped at 32.
-    pub fn fromEnv(comptime prefix: []const u8) ServerConfig {
+    pub fn fromEnv(comptime prefix: []const u8, env: *const std.process.Environ.Map) ServerConfig {
         var config = ServerConfig{};
-        if (std.posix.getenv(prefix ++ "PORT")) |v| {
+        if (env.get(prefix ++ "PORT")) |v| {
             config.port = std.fmt.parseInt(u16, v, 10) catch 8080;
         }
-        if (std.posix.getenv(prefix ++ "CACHE_SIZE_MB")) |v| {
+        if (env.get(prefix ++ "CACHE_SIZE_MB")) |v| {
             config.cache_size_mb = std.fmt.parseInt(u32, v, 10) catch 256;
         }
-        if (std.posix.getenv(prefix ++ "THREAD_COUNT")) |v| {
+        if (env.get(prefix ++ "THREAD_COUNT")) |v| {
             config.thread_count = std.fmt.parseInt(u32, v, 10) catch 0;
         }
         if (config.thread_count == 0) {
             const max_threads: u32 = 32;
             config.thread_count = @intCast(@min(std.Thread.getCpuCount() catch 8, max_threads));
         }
-        if (std.posix.getenv(prefix ++ "SNAPSHOT_INTERVAL_S")) |v| {
+        if (env.get(prefix ++ "SNAPSHOT_INTERVAL_S")) |v| {
             config.snapshot_interval_s = std.fmt.parseInt(u32, v, 10) catch 300;
         }
-        if (std.posix.getenv(prefix ++ "WAL_SYNC_INTERVAL_MS")) |v| {
+        if (env.get(prefix ++ "WAL_SYNC_INTERVAL_MS")) |v| {
             config.wal_sync_interval_ms = std.fmt.parseInt(u32, v, 10) catch 50;
         }
-        if (std.posix.getenv(prefix ++ "WAL_BATCH_SIZE")) |v| {
+        if (env.get(prefix ++ "WAL_BATCH_SIZE")) |v| {
             config.wal_batch_size = std.fmt.parseInt(u32, v, 10) catch 256;
         }
-        if (std.posix.getenv(prefix ++ "BIND")) |v| {
+        if (env.get(prefix ++ "BIND")) |v| {
             config.bind_address = parseIpv4(v) orelse .{ 127, 0, 0, 1 };
         }
-        if (std.posix.getenv(prefix ++ "TRUSTED")) |v| {
+        if (env.get(prefix ++ "TRUSTED")) |v| {
             config.parseTrustedIps(v);
         }
         return config;
@@ -74,7 +74,7 @@ pub const ServerConfig = struct {
 
             if (token.len == 0) continue;
 
-            if (std.mem.indexOfScalar(u8, token, '/') != null) {
+            if (std.mem.findScalar(u8, token, '/') != null) {
                 if (cidr_count >= MAX_TRUSTED_IPS) {
                     log.warn("trusted-ip list: dropping CIDR '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
                     continue;
@@ -133,7 +133,7 @@ fn maskU32(prefix: u6) u32 {
 }
 
 fn parseCidr(s: []const u8) ?Cidr {
-    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, s, '/') orelse return null;
     const ip = parseIpv4(s[0..slash]) orelse return null;
     const prefix = std.fmt.parseInt(u6, s[slash + 1 ..], 10) catch return null;
     if (prefix > 32) return null;

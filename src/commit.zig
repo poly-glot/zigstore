@@ -91,14 +91,14 @@ pub fn commitSeq(
     }
 
     {
-        store.apply_mutex.lock();
-        defer store.apply_mutex.unlock();
+        store.apply_mutex.lockUncancelable(store.io);
+        defer store.apply_mutex.unlock(store.io);
         while (store.last_applied_seq + 1 < seq) {
-            store.apply_cond.wait(&store.apply_mutex);
+            store.apply_cond.waitUncancelable(store.io, &store.apply_mutex);
         }
         const apply_result = apply_fn(ctx, record);
         store.last_applied_seq = seq;
-        store.apply_cond.broadcast();
+        store.apply_cond.broadcast(store.io);
         try apply_result;
     }
 
@@ -160,11 +160,11 @@ const TestRecord = struct {
 const Applied = struct {
     seqs: [256]u64 = undefined,
     count: usize = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
     fn record(self: *Applied, seq: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.testing.io);
+        defer self.mutex.unlock(std.testing.io);
         if (self.count < self.seqs.len) {
             self.seqs[self.count] = seq;
             self.count += 1;
@@ -203,10 +203,10 @@ test "commit fails without a WAL writer" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
-    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    const store = try TestStore.init(std.testing.io, allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
     defer store.deinit();
 
     if (store.wal_writer) |*w| w.deinit();
@@ -219,12 +219,12 @@ test "concurrent commits apply in WAL-sequence order and advance last_applied_se
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     applied_log = .{};
 
-    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    const store = try TestStore.init(std.testing.io, allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
     defer store.deinit();
 
     const per_thread = 50;
@@ -249,10 +249,10 @@ test "commitSeq returns the assigned monotonic WAL sequence" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
-    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    const store = try TestStore.init(std.testing.io, allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
     defer store.deinit();
 
     const s1 = try commitSeq(TestRecord, store, 1, .{ .id = 1, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{});
@@ -267,10 +267,10 @@ test "commitSeq await_quorum=false skips an installed gate that commit blocks on
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
-    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    const store = try TestStore.init(std.testing.io, allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
     defer store.deinit();
 
     const gate = store.syncGate();
@@ -287,10 +287,10 @@ test "completion path: applies synchronously, returns without waiting, records t
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
-    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    const store = try TestStore.init(std.testing.io, allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
     defer store.deinit();
 
     var c1 = CommitCompletion{};
@@ -319,18 +319,18 @@ test "once a WAL flush has failed the store refuses further commits" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
-    const store = try TestStore.init(allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
+    const store = try TestStore.init(std.testing.io, allocator, .{ .data_dir = dir, .cache_size_mb = 16 });
     defer store.deinit();
 
     _ = try commitSeq(TestRecord, store, 1, .{ .id = 1, .value = 1 }, store, serializeTestRecord, applyTestRecord, .{});
 
     {
         const w = &store.wal_writer.?;
-        w.lock.lock();
-        defer w.lock.unlock();
+        w.lock.lockUncancelable(std.testing.io);
+        defer w.lock.unlock(std.testing.io);
         w.fsync_failed = true;
         w.flush_failed_pub.store(true, .release);
     }

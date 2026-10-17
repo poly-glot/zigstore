@@ -107,6 +107,9 @@ test {
     _ = @import("wire_codec.zig");
     _ = @import("tsgen.zig");
     _ = @import("file_header.zig");
+    _ = @import("reflect.zig");
+    _ = @import("sys.zig");
+    _ = @import("timed_condition.zig");
 
     _ = @import("page.zig");
     _ = @import("page_cache.zig");

@@ -16,8 +16,8 @@ const slotsFromConstPage = btree.slotsFromConstPage;
 const isLeaf = btree.isLeaf;
 
 pub fn search(self: *BPlusTree, key: []const u8, out_buf: []u8) !?[]const u8 {
-    self.lock.lockShared();
-    defer self.lock.unlockShared();
+    self.lock.lockSharedUncancelable(self.io);
+    defer self.lock.unlockShared(self.io);
 
     if (self.root_page == INVALID_PAGE) return null;
 
@@ -162,8 +162,8 @@ pub fn findInsertPos(_: *BPlusTree, pg: *const Page, key: []const u8) u32 {
 const page_cache = @import("../page_cache.zig");
 const freelist = @import("../freelist.zig");
 
-fn createTempFile(name: []const u8) !std.fs.File {
-    return std.fs.cwd().createFile(name, .{
+fn createTempFile(name: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(std.testing.io, name, .{
         .read = true,
         .truncate = true,
     });
@@ -172,14 +172,14 @@ fn createTempFile(name: []const u8) !std.fs.File {
 test "insert and search" {
     const path = "/tmp/test_btree_basic.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 64);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
 
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     try tree.insert("hello", "world");
     try tree.insert("foo", "bar");
@@ -206,14 +206,14 @@ test "insert and search" {
 test "range scan" {
     const path = "/tmp/test_btree_range.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 64);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
 
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     try tree.insert("a", "1");
     try tree.insert("b", "2");

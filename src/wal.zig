@@ -1,5 +1,7 @@
 const std = @import("std");
-const posix = std.posix;
+const Io = std.Io;
+const sys = @import("sys.zig");
+const TimedCondition = @import("timed_condition.zig").TimedCondition;
 
 const log = std.log.scoped(.wal);
 
@@ -14,10 +16,10 @@ const test_op: u8 = 100;
 pub const WalEntryHeader = extern struct {
     sequence: u64,
     op_code: u8,
-    _pad: [3]u8 = .{0} ** 3,
+    _pad: [3]u8 = @splat(0),
     data_len: u32,
     checksum: u32,
-    _pad2: [4]u8 = .{0} ** 4,
+    _pad2: [4]u8 = @splat(0),
 };
 
 comptime {
@@ -46,7 +48,8 @@ pub const DurabilityNotifier = struct {
 };
 
 pub const WalWriter = struct {
-    file: std.fs.File,
+    io: Io,
+    file: Io.File,
     sequence: u64,
     allocator: std.mem.Allocator,
 
@@ -55,10 +58,10 @@ pub const WalWriter = struct {
     entry_count: u32,
     batch_size: u32,
 
-    lock: std.Thread.Mutex,
-    flush_cond: std.Thread.Condition,
+    lock: Io.Mutex,
+    flush_cond: TimedCondition,
     back_in_flight: bool,
-    flush_done_cond: std.Thread.Condition,
+    flush_done_cond: TimedCondition,
     pending_max_seq: u64,
     last_durable_seq: u64,
     fsync_failed: bool,
@@ -78,43 +81,41 @@ pub const WalWriter = struct {
     notifier: ?DurabilityNotifier,
 
     appends_paused: bool,
-    append_cond: std.Thread.Condition,
+    append_cond: Io.Condition,
 
-    pub fn init(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool) !WalWriter {
-        const path = try std.fs.path.join(allocator, &.{ dir, "wal.bin" });
+    pub fn init(io: Io, allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64, want_direct_io: bool) !WalWriter {
+        const path = try Io.Dir.path.join(allocator, &.{ dir, "wal.bin" });
         defer allocator.free(path);
 
         const effective_batch_size: u32 = if (batch_size == 0) 32 else batch_size;
 
-        const scan_file = try openOrCreateFile(path);
-        const scan = scanWal(scan_file, allocator, effective_batch_size) catch |err| {
-            scan_file.close();
+        const scan_file = try openOrCreateFile(io, path);
+        const scan = scanWal(io, scan_file, allocator, effective_batch_size) catch |err| {
+            scan_file.close(io);
             return err;
         };
 
         const file, const direct_io = blk: {
-            if (want_direct_io) break :blk openWithDirect(path);
-            const buffered = openOrCreateFile(path) catch |err| {
-                scan_file.close();
+            if (want_direct_io) break :blk openWithDirect(io, path);
+            const buffered = openOrCreateFile(io, path) catch |err| {
+                scan_file.close(io);
                 return err;
             };
             break :blk .{ buffered, false };
         };
-        errdefer file.close();
+        errdefer file.close(io);
 
-        const initial_offset = settleTail(scan_file, scan.valid_end, direct_io) catch |err| {
-            scan_file.close();
+        const initial_offset = settleTail(io, scan_file, scan.valid_end, direct_io) catch |err| {
+            scan_file.close(io);
             return err;
         };
-        scan_file.close();
+        scan_file.close(io);
 
         if (direct_io) {
-            fallocatePosix(file.handle, PREALLOC_SIZE) catch |err| {
+            sys.fallocate(file.handle, PREALLOC_SIZE) catch |err| {
                 log.warn("WAL fallocate({d} MiB) failed: {} — proceeding without preallocation", .{ PREALLOC_SIZE / (1024 * 1024), err });
             };
         }
-
-        try file.seekTo(initial_offset);
 
         const direct_buf = if (direct_io)
             try allocator.alignedAlloc(u8, .fromByteUnits(BLOCK_SIZE), 256 * 1024)
@@ -127,13 +128,14 @@ pub const WalWriter = struct {
         }
 
         return WalWriter{
+            .io = io,
             .file = file,
             .sequence = @max(scan.last_sequence, base_sequence),
-            .front = .{},
-            .back = .{},
+            .front = .empty,
+            .back = .empty,
             .entry_count = 0,
             .batch_size = effective_batch_size,
-            .lock = .{},
+            .lock = .init,
             .flush_cond = .{},
             .back_in_flight = false,
             .flush_done_cond = .{},
@@ -154,7 +156,7 @@ pub const WalWriter = struct {
             .flush_failed_pub = std.atomic.Value(bool).init(false),
             .notifier = null,
             .appends_paused = false,
-            .append_cond = .{},
+            .append_cond = .init,
         };
     }
 
@@ -162,24 +164,24 @@ pub const WalWriter = struct {
     /// that, once every already-appended entry has applied, no WAL entry can exist that the
     /// checkpoint does not contain. Appends in flight finish; the flusher keeps running.
     pub fn pauseAppends(self: *WalWriter) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         self.appends_paused = true;
     }
 
     /// Lift `pauseAppends` and wake every blocked `append`.
     pub fn resumeAppends(self: *WalWriter) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         self.appends_paused = false;
-        self.append_cond.broadcast();
+        self.append_cond.broadcast(self.io);
     }
 
     /// Registers the async durability listener (see `DurabilityNotifier`). Call before
     /// `startFlusher`; a single notifier serves all reactors, fanning out inside `notify`.
     pub fn setNotifier(self: *WalWriter, n: DurabilityNotifier) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         self.notifier = n;
     }
 
@@ -187,8 +189,8 @@ pub const WalWriter = struct {
     /// fire the notifier while holding the same lock, once this returns no in-flight fire is
     /// running and none will start — the safe teardown barrier before the listener is freed.
     pub fn clearNotifier(self: *WalWriter) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         self.notifier = null;
     }
 
@@ -223,38 +225,37 @@ pub const WalWriter = struct {
 
     pub fn deinit(self: *WalWriter) void {
         self.shutdown.store(true, .release);
-        self.flush_cond.signal();
+        self.flush_cond.signal(self.io);
 
         if (self.flusher_thread) |t| t.join();
 
-        self.lock.lock();
+        self.lock.lockUncancelable(self.io);
         self.swapAndFlush() catch |err| {
             log.err("WAL final flush failed: {}", .{err});
         };
-        self.lock.unlock();
+        self.lock.unlock(self.io);
 
         self.front.deinit(self.allocator);
         self.back.deinit(self.allocator);
         self.allocator.free(self.direct_buf);
-        self.file.close();
+        self.file.close(self.io);
     }
 
     pub fn truncateAfterCheckpoint(self: *WalWriter) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
         if (self.retain_floor.load(.acquire) < self.sequence) return error.WalRetainedByReplica;
 
         try self.swapAndFlush();
 
-        try self.file.setEndPos(0);
-        try self.file.seekTo(0);
-        posix.fdatasync(self.file.handle) catch |err| {
+        try sys.ftruncate(self.file.handle, 0);
+        sys.fdatasync(self.file.handle) catch |err| {
             log.warn("WAL truncate fdatasync failed: {}", .{err});
         };
 
         if (self.direct_io) {
-            fallocatePosix(self.file.handle, PREALLOC_SIZE) catch |err| {
+            sys.fallocate(self.file.handle, PREALLOC_SIZE) catch |err| {
                 log.warn("WAL post-truncate fallocate failed: {}", .{err});
             };
         }
@@ -265,7 +266,7 @@ pub const WalWriter = struct {
         self.durable_offset = 0;
         self.truncation_epoch += 1;
         self.publishDurable();
-        self.flush_done_cond.broadcast();
+        self.flush_done_cond.broadcast(self.io);
     }
 
     pub fn append(self: *WalWriter, op_code: u8, data: []const u8) !u64 {
@@ -273,10 +274,10 @@ pub const WalWriter = struct {
 
         const checksum = std.hash.crc.Crc32.hash(data);
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
-        while (self.appends_paused) self.append_cond.wait(&self.lock);
+        while (self.appends_paused) self.append_cond.waitUncancelable(self.io, &self.lock);
         try self.front.ensureUnusedCapacity(self.allocator, HEADER_SIZE + data.len);
 
         self.sequence += 1;
@@ -285,10 +286,10 @@ pub const WalWriter = struct {
         const header = WalEntryHeader{
             .sequence = seq,
             .op_code = op_code,
-            ._pad = .{0} ** 3,
+            ._pad = @splat(0),
             .data_len = @intCast(data.len),
             .checksum = checksum,
-            ._pad2 = .{0} ** 4,
+            ._pad2 = @splat(0),
         };
 
         const header_bytes: *const [HEADER_SIZE]u8 = @ptrCast(&header);
@@ -299,7 +300,7 @@ pub const WalWriter = struct {
         self.pending_max_seq = seq;
 
         if (self.entry_count >= self.batch_size) {
-            self.flush_cond.signal();
+            self.flush_cond.signal(self.io);
         }
 
         return seq;
@@ -307,30 +308,30 @@ pub const WalWriter = struct {
 
     pub fn awaitDurable(self: *WalWriter, seq: u64) !void {
         if (seq == 0) return;
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         while (self.last_durable_seq < seq) {
             if (self.fsync_failed) return error.WalFlushFailed;
-            self.flush_cond.signal();
-            self.flush_done_cond.wait(&self.lock);
+            self.flush_cond.signal(self.io);
+            self.flush_done_cond.wait(self.io, &self.lock);
         }
     }
 
     pub fn sync(self: *WalWriter) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         try self.swapAndFlush();
     }
 
     pub fn getSequence(self: *WalWriter) u64 {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         return self.sequence;
     }
 
     pub fn durableBoundary(self: *WalWriter) DurableBoundary {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         return .{
             .sequence = self.last_durable_seq,
             .offset = self.durable_offset,
@@ -339,10 +340,10 @@ pub const WalWriter = struct {
     }
 
     pub fn waitDurableBeyond(self: *WalWriter, sequence: u64, timeout_ns: u64) bool {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         if (self.last_durable_seq > sequence) return true;
-        self.flush_done_cond.timedWait(&self.lock, timeout_ns) catch {};
+        self.flush_done_cond.timedWait(self.io, &self.lock, timeout_ns);
         return self.last_durable_seq > sequence;
     }
 
@@ -367,7 +368,7 @@ pub const WalWriter = struct {
 
     fn swapAndFlush(self: *WalWriter) !void {
         while (self.back_in_flight) {
-            self.flush_done_cond.wait(&self.lock);
+            self.flush_done_cond.wait(self.io, &self.lock);
         }
 
         if (self.front.items.len == 0) return;
@@ -383,12 +384,12 @@ pub const WalWriter = struct {
         self.flushBack() catch |err| {
             self.fsync_failed = true;
             self.publishFailure();
-            self.flush_done_cond.broadcast();
+            self.flush_done_cond.broadcast(self.io);
             return err;
         };
 
         self.markDurable(flush_seq);
-        self.flush_done_cond.broadcast();
+        self.flush_done_cond.broadcast(self.io);
     }
 
     fn markDurable(self: *WalWriter, flush_seq: u64) void {
@@ -416,14 +417,14 @@ pub const WalWriter = struct {
             @memcpy(self.direct_buf[0..n], self.back.items);
             @memset(self.direct_buf[n..padded], PAD_BYTE);
 
-            try self.file.pwriteAll(self.direct_buf[0..padded], self.write_offset);
+            try sys.pwriteAll(self.file.handle, self.direct_buf[0..padded], self.write_offset);
             self.write_offset += padded;
         } else {
-            try self.file.writeAll(self.back.items);
+            try sys.pwriteAll(self.file.handle, self.back.items, self.write_offset);
             self.write_offset += self.back.items.len;
         }
 
-        try posix.fdatasync(self.file.handle);
+        try sys.fdatasync(self.file.handle);
         _ = self.fsync_count.fetchAdd(1, .monotonic);
     }
 
@@ -433,33 +434,30 @@ pub const WalWriter = struct {
         return aligned;
     }
 
-    fn settleTail(scan_file: std.fs.File, valid_end: u64, direct_io: bool) !u64 {
-        try scan_file.setEndPos(valid_end);
+    fn settleTail(io: Io, scan_file: Io.File, valid_end: u64, direct_io: bool) !u64 {
+        try scan_file.setLength(io, valid_end);
         if (!direct_io) return valid_end;
 
         const settled = paddedLength(@intCast(valid_end));
         if (settled > valid_end) {
             var pad: [2 * BLOCK_SIZE]u8 = undefined;
             @memset(&pad, PAD_BYTE);
-            try scan_file.pwriteAll(pad[0..@intCast(settled - valid_end)], valid_end);
-            try scan_file.sync();
+            try sys.pwriteAll(scan_file.handle, pad[0..@intCast(settled - valid_end)], valid_end);
+            try sys.fsync(scan_file.handle);
         }
         return settled;
     }
 
     fn flusherLoop(self: *WalWriter) void {
         while (!self.shutdown.load(.acquire)) {
-            self.lock.lock();
+            self.lock.lockUncancelable(self.io);
 
             if (self.entry_count < self.batch_size and !self.shutdown.load(.acquire)) {
-                self.flush_cond.timedWait(
-                    &self.lock,
-                    2 * std.time.ns_per_ms,
-                ) catch {};
+                self.flush_cond.timedWait(self.io, &self.lock, 2 * std.time.ns_per_ms);
             }
 
             if (self.front.items.len == 0) {
-                self.lock.unlock();
+                self.lock.unlock(self.io);
                 continue;
             }
 
@@ -471,11 +469,11 @@ pub const WalWriter = struct {
             self.entry_count = 0;
             self.pending_max_seq = 0;
             self.back_in_flight = true;
-            self.lock.unlock();
+            self.lock.unlock(self.io);
 
             const flush_result = self.flushBack();
 
-            self.lock.lock();
+            self.lock.lockUncancelable(self.io);
             if (flush_result) |_| {
                 self.markDurable(flush_seq);
             } else |err| {
@@ -484,11 +482,11 @@ pub const WalWriter = struct {
                 self.publishFailure();
             }
             self.back_in_flight = false;
-            self.flush_done_cond.broadcast();
-            self.lock.unlock();
+            self.flush_done_cond.broadcast(self.io);
+            self.lock.unlock(self.io);
         }
 
-        self.lock.lock();
+        self.lock.lockUncancelable(self.io);
         if (self.front.items.len > 0) {
             const flush_seq = self.pending_max_seq;
             const tmp = self.front;
@@ -497,11 +495,11 @@ pub const WalWriter = struct {
             self.entry_count = 0;
             self.pending_max_seq = 0;
             self.back_in_flight = true;
-            self.lock.unlock();
+            self.lock.unlock(self.io);
 
             const drain_result = self.flushBack();
 
-            self.lock.lock();
+            self.lock.lockUncancelable(self.io);
             if (drain_result) |_| {
                 self.markDurable(flush_seq);
             } else |_| {
@@ -509,41 +507,30 @@ pub const WalWriter = struct {
                 self.publishFailure();
             }
             self.back_in_flight = false;
-            self.flush_done_cond.broadcast();
+            self.flush_done_cond.broadcast(self.io);
         }
-        self.lock.unlock();
+        self.lock.unlock(self.io);
     }
 
-    fn fallocatePosix(fd: i32, length: u64) !void {
-        const rc = std.os.linux.fallocate(fd, 0, 0, @intCast(length));
-        const err = posix.errno(rc);
-        switch (err) {
-            .SUCCESS => return,
-            .OPNOTSUPP, .NOSYS => return error.OperationNotSupported,
-            else => return posix.unexpectedErrno(err),
-        }
-    }
-
-    fn openWithDirect(path: []const u8) struct { std.fs.File, bool } {
-        const O = posix.O;
-        const flags: O = .{
+    fn openWithDirect(io: Io, path: []const u8) struct { Io.File, bool } {
+        const flags: sys.OpenFlags = .{
             .ACCMODE = .RDWR,
             .CREAT = true,
             .CLOEXEC = true,
             .DIRECT = true,
         };
-        const direct_fd = posix.open(path, flags, 0o644) catch |err| {
+        const direct_fd = sys.open(path, flags, 0o644) catch |err| {
             log.warn("WAL: O_DIRECT open failed ({}); using buffered I/O", .{err});
-            const fallback = openOrCreateFile(path) catch unreachable;
+            const fallback = openOrCreateFile(io, path) catch unreachable;
             return .{ fallback, false };
         };
-        return .{ std.fs.File{ .handle = direct_fd }, true };
+        return .{ Io.File{ .handle = direct_fd, .flags = .{ .nonblocking = false } }, true };
     }
 
-    fn openOrCreateFile(path: []const u8) !std.fs.File {
-        return std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
+    fn openOrCreateFile(io: Io, path: []const u8) !Io.File {
+        return Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => {
-                return try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
+                return try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
             },
             else => return err,
         };
@@ -570,18 +557,18 @@ pub const WalWriter = struct {
             std.mem.allEqual(u8, &header._pad2, 0);
     }
 
-    fn scanWal(file: std.fs.File, allocator: std.mem.Allocator, batch_size: u32) !ScanResult {
-        const file_size = try file.getEndPos();
+    fn scanWal(io: Io, file: Io.File, allocator: std.mem.Allocator, batch_size: u32) !ScanResult {
+        const file_size = try file.length(io);
         if (file_size == 0) return .{ .last_sequence = 0, .valid_end = 0 };
 
-        var data_buf: std.ArrayList(u8) = .{};
+        var data_buf: std.ArrayList(u8) = .empty;
         defer data_buf.deinit(allocator);
 
         var last_seq: u64 = 0;
         var pos: u64 = 0;
 
         while (pos + HEADER_SIZE <= file_size) {
-            switch (try readRecord(file, pos, file_size, last_seq, &data_buf, allocator)) {
+            switch (try readRecord(file.handle, pos, file_size, last_seq, &data_buf, allocator)) {
                 .valid => |record| {
                     last_seq = record.sequence;
                     pos = record.end;
@@ -593,7 +580,7 @@ pub const WalWriter = struct {
                     pos = next_block;
                 },
                 .invalid => {
-                    const trailing = try countValidRecordsAfter(file, pos, file_size, last_seq, &data_buf, allocator, batch_size);
+                    const trailing = try countValidRecordsAfter(file.handle, pos, file_size, last_seq, &data_buf, allocator, batch_size);
                     if (trailing > batch_size) {
                         log.warn("WAL: corrupt record at offset {d} is followed by {d} valid records (more than one batch of {d}); refusing to start", .{ pos, trailing, batch_size });
                         return error.WalCorrupt;
@@ -607,9 +594,9 @@ pub const WalWriter = struct {
         return .{ .last_sequence = last_seq, .valid_end = pos };
     }
 
-    fn readRecord(file: std.fs.File, pos: u64, file_size: u64, last_seq: u64, data_buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !RecordVerdict {
+    fn readRecord(fd: sys.fd_t, pos: u64, file_size: u64, last_seq: u64, data_buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !RecordVerdict {
         var header_buf: [HEADER_SIZE]u8 = undefined;
-        const hn = try file.preadAll(&header_buf, pos);
+        const hn = try sys.preadAll(fd, &header_buf, pos);
         if (hn < HEADER_SIZE) return .invalid;
         if (std.mem.allEqual(u8, &header_buf, 0)) return .preallocated;
         if (std.mem.allEqual(u8, &header_buf, PAD_BYTE)) return .padding;
@@ -621,20 +608,20 @@ pub const WalWriter = struct {
         if (end > file_size) return .invalid;
 
         try data_buf.resize(allocator, header.data_len);
-        const dn = try file.preadAll(data_buf.items, pos + HEADER_SIZE);
+        const dn = try sys.preadAll(fd, data_buf.items, pos + HEADER_SIZE);
         if (dn < header.data_len) return .invalid;
         if (std.hash.crc.Crc32.hash(data_buf.items) != header.checksum) return .invalid;
 
         return .{ .valid = .{ .sequence = header.sequence, .end = end } };
     }
 
-    fn countValidRecordsAfter(file: std.fs.File, bad_pos: u64, file_size: u64, last_seq: u64, data_buf: *std.ArrayList(u8), allocator: std.mem.Allocator, limit: u32) !u32 {
+    fn countValidRecordsAfter(fd: sys.fd_t, bad_pos: u64, file_size: u64, last_seq: u64, data_buf: *std.ArrayList(u8), allocator: std.mem.Allocator, limit: u32) !u32 {
         var count: u32 = 0;
         var seq = last_seq;
         var pos = std.mem.alignForward(u64, bad_pos + 1, BLOCK_SIZE);
 
         while (pos + HEADER_SIZE <= file_size and count <= limit) {
-            switch (try readRecord(file, pos, file_size, seq, data_buf, allocator)) {
+            switch (try readRecord(fd, pos, file_size, seq, data_buf, allocator)) {
                 .valid => |record| {
                     count += 1;
                     seq = record.sequence;
@@ -651,7 +638,7 @@ pub const WalWriter = struct {
 
 fn initHeap(allocator: std.mem.Allocator, dir: []const u8, batch_size: u32, base_sequence: u64) !*WalWriter {
     const w = try allocator.create(WalWriter);
-    w.* = try WalWriter.init(allocator, dir, batch_size, base_sequence, true);
+    w.* = try WalWriter.init(std.testing.io, allocator, dir, batch_size, base_sequence, true);
     try w.startFlusher();
     return w;
 }
@@ -662,11 +649,23 @@ fn deinitHeap(w: *WalWriter) void {
     allocator.destroy(w);
 }
 
+fn resetTestDir(tmp_dir: []const u8) void {
+    Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
+    Io.Dir.createDirAbsolute(std.testing.io, tmp_dir, .default_dir) catch {};
+}
+
+fn removeTestDir(tmp_dir: []const u8) void {
+    Io.Dir.cwd().deleteTree(std.testing.io, tmp_dir) catch {};
+}
+
+fn sleepMs(ms: i64) void {
+    std.testing.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
 test "append entries and verify sequence" {
     const tmp_dir = "/tmp/wal_test_append";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
     defer deinitHeap(writer);
@@ -683,9 +682,8 @@ test "append entries and verify sequence" {
 
 test "sync flushes to disk" {
     const tmp_dir = "/tmp/wal_test_sync";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
@@ -709,9 +707,8 @@ test "sync flushes to disk" {
 
 test "durability notifier fires on flush and the published watermark tracks last_durable_seq" {
     const tmp_dir = "/tmp/wal_test_notifier";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const Sink = struct {
         fires: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -738,9 +735,8 @@ test "durability notifier fires on flush and the published watermark tracks last
 
 test "batch auto-flush on reaching batch_size" {
     const tmp_dir = "/tmp/wal_test_batch";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initHeap(std.testing.allocator, tmp_dir, 3, 0);
     defer deinitHeap(writer);
@@ -748,21 +744,21 @@ test "batch auto-flush on reaching batch_size" {
     _ = try writer.append(test_op, "a");
     _ = try writer.append(test_op, "b");
     {
-        writer.lock.lock();
+        writer.lock.lockUncancelable(std.testing.io);
         const has_data = writer.front.items.len > 0;
-        writer.lock.unlock();
+        writer.lock.unlock(std.testing.io);
         try std.testing.expect(has_data);
     }
 
     _ = try writer.append(test_op, "c");
 
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    sleepMs(20);
 
     {
-        writer.lock.lock();
+        writer.lock.lockUncancelable(std.testing.io);
         const front_empty = writer.front.items.len == 0;
         const count_zero = writer.entry_count == 0;
-        writer.lock.unlock();
+        writer.lock.unlock(std.testing.io);
         try std.testing.expect(front_empty);
         try std.testing.expect(count_zero);
     }
@@ -770,9 +766,8 @@ test "batch auto-flush on reaching batch_size" {
 
 test "async WAL: concurrent writers" {
     const tmp_dir = "/tmp/wal_test_concurrent";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initHeap(std.testing.allocator, tmp_dir, 16, 0);
     defer deinitHeap(writer);
@@ -800,9 +795,8 @@ test "async WAL: concurrent writers" {
 
 test "async WAL: deinit flushes all pending entries" {
     const tmp_dir = "/tmp/wal_test_deinit";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 1000, 0);
@@ -822,9 +816,8 @@ test "async WAL: deinit flushes all pending entries" {
 
 test "truncateAfterCheckpoint zeroes the WAL and preserves the sequence" {
     const tmp_dir = "/tmp/wal_test_truncate_checkpoint";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
@@ -839,11 +832,11 @@ test "truncateAfterCheckpoint zeroes the WAL and preserves the sequence" {
 
         try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
 
-        const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
+        const path = try Io.Dir.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
         defer std.testing.allocator.free(path);
-        const scan_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer scan_file.close();
-        const recovered = try WalWriter.scanWal(scan_file, std.testing.allocator, 32);
+        const scan_file = try Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer scan_file.close(std.testing.io);
+        const recovered = try WalWriter.scanWal(std.testing.io, scan_file, std.testing.allocator, 32);
         try std.testing.expectEqual(@as(u64, 0), recovered.last_sequence);
 
         const seq = try writer.append(test_op, "post-truncate");
@@ -859,9 +852,8 @@ test "truncateAfterCheckpoint zeroes the WAL and preserves the sequence" {
 
 test "init resumes the sequence from base_sequence over an empty WAL" {
     const tmp_dir = "/tmp/wal_test_base_sequence";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 17);
     defer deinitHeap(writer);
@@ -873,9 +865,8 @@ test "init resumes the sequence from base_sequence over an empty WAL" {
 
 test "retain floor blocks truncation until replicas ack the full WAL" {
     const tmp_dir = "/tmp/wal_test_retain_floor";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
     defer deinitHeap(writer);
@@ -894,9 +885,8 @@ test "retain floor blocks truncation until replicas ack the full WAL" {
 
 test "post-truncate appends carry monotonic sequences and survive reopen" {
     const tmp_dir = "/tmp/wal_test_post_truncate_monotonic";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     var final_seq: u64 = 0;
     {
@@ -925,9 +915,8 @@ test "direct-io: restart after appends does not orphan later entries" {
     const wal_replay = @import("wal_replay.zig");
 
     const tmp_dir = "/tmp/wal_test_restart_no_orphan";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
@@ -948,7 +937,7 @@ test "direct-io: restart after appends does not orphan later entries" {
         try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
     }
 
-    const reader_opt = try wal_replay.WalReader.init(tmp_dir);
+    const reader_opt = try wal_replay.WalReader.init(std.testing.io, tmp_dir);
     var reader = reader_opt.?;
     defer reader.close();
     var count: u64 = 0;
@@ -985,8 +974,8 @@ fn stressAppenderRun(ctx: StressCtx) void {
 fn stressTruncateRun(ctx: StressCtx) void {
     var prng = std.Random.DefaultPrng.init(0xABCDEF01);
     while (!ctx.should_stop.load(.acquire)) {
-        const jitter_ms = prng.random().intRangeAtMost(u64, 30, 80);
-        std.Thread.sleep(jitter_ms * std.time.ns_per_ms);
+        const jitter_ms = prng.random().intRangeAtMost(i64, 30, 80);
+        sleepMs(jitter_ms);
 
         if (ctx.should_stop.load(.acquire)) break;
         ctx.writer.truncateAfterCheckpoint() catch return;
@@ -997,8 +986,8 @@ fn stressTruncateRun(ctx: StressCtx) void {
 fn stressSyncRun(ctx: StressCtx) void {
     var prng = std.Random.DefaultPrng.init(0x13579BDF);
     while (!ctx.should_stop.load(.acquire)) {
-        const jitter_ms = prng.random().intRangeAtMost(u64, 5, 25);
-        std.Thread.sleep(jitter_ms * std.time.ns_per_ms);
+        const jitter_ms = prng.random().intRangeAtMost(i64, 5, 25);
+        sleepMs(jitter_ms);
 
         if (ctx.should_stop.load(.acquire)) break;
         ctx.writer.sync() catch return;
@@ -1010,9 +999,8 @@ test "stress: concurrent append + sync + truncate, then recovery contract" {
     const wal_replay = @import("wal_replay.zig");
 
     const tmp_dir = "/tmp/wal_stress_v2";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initHeap(std.testing.allocator, tmp_dir, 64, 0);
     defer deinitHeap(writer);
@@ -1034,7 +1022,7 @@ test "stress: concurrent append + sync + truncate, then recovery contract" {
     const truncate_thread = try std.Thread.spawn(.{}, stressTruncateRun, .{ctx});
     const sync_thread = try std.Thread.spawn(.{}, stressSyncRun, .{ctx});
 
-    std.Thread.sleep(1500 * std.time.ns_per_ms);
+    sleepMs(1500);
     should_stop.store(true, .release);
 
     for (&appender_threads) |*t| t.join();
@@ -1045,7 +1033,7 @@ test "stress: concurrent append + sync + truncate, then recovery contract" {
     const final_seq = writer.getSequence();
 
     {
-        var reader_opt = try wal_replay.WalReader.init(tmp_dir);
+        var reader_opt = try wal_replay.WalReader.init(std.testing.io, tmp_dir);
         if (reader_opt) |*reader| {
             defer reader.close();
             var last_seen: u64 = 0;
@@ -1068,7 +1056,7 @@ test "stress: concurrent append + sync + truncate, then recovery contract" {
         const writer2 = try initHeap(std.testing.allocator, tmp_dir, 64, final_seq);
         defer deinitHeap(writer2);
         try std.testing.expectEqual(final_seq, writer2.getSequence());
-        const next_payload = [_]u8{0} ** 8;
+        const next_payload: [8]u8 = @splat(0);
         const new_seq = try writer2.append(test_op, &next_payload);
         try std.testing.expectEqual(final_seq + 1, new_seq);
         try writer2.sync();
@@ -1081,9 +1069,8 @@ test "stress: concurrent append + sync + truncate, then recovery contract" {
 
 test "init propagates a scan failure instead of truncating the WAL" {
     const tmp_dir = "/tmp/wal_test_scan_failure";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    std.fs.makeDirAbsolute(tmp_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     {
         const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
@@ -1097,7 +1084,7 @@ test "init propagates a scan failure instead of truncating the WAL" {
     var fail_index: usize = 0;
     while (fail_index < 16) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var writer = WalWriter.init(failing.allocator(), tmp_dir, 32, 0, true) catch {
+        var writer = WalWriter.init(std.testing.io, failing.allocator(), tmp_dir, 32, 0, true) catch {
             saw_failure = true;
             continue;
         };
@@ -1115,9 +1102,8 @@ test "init propagates a scan failure instead of truncating the WAL" {
 
 test "append blocks while appends are paused and completes after resume" {
     const tmp_dir = "/tmp/wal_test_pause_appends";
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-    try std.fs.makeDirAbsolute(tmp_dir);
-    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+    resetTestDir(tmp_dir);
+    defer removeTestDir(tmp_dir);
 
     const writer = try initHeap(std.testing.allocator, tmp_dir, 32, 0);
     defer deinitHeap(writer);
@@ -1136,7 +1122,7 @@ test "append blocks while appends are paused and completes after resume" {
     var appender = Appender{};
     const thread = try std.Thread.spawn(.{}, Appender.run, .{ &appender, writer });
 
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    sleepMs(30);
     try std.testing.expect(!appender.done.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), writer.getSequence());
 
@@ -1146,32 +1132,32 @@ test "append blocks while appends are paused and completes after resume" {
     try std.testing.expectEqual(@as(u64, 1), appender.seq);
 }
 
-fn writeRawRecord(file: std.fs.File, offset: u64, sequence: u64, data: []const u8, checksum: u32) !u64 {
+fn writeRawRecord(file: Io.File, offset: u64, sequence: u64, data: []const u8, checksum: u32) !u64 {
     const header = WalEntryHeader{
         .sequence = sequence,
         .op_code = test_op,
         .data_len = @intCast(data.len),
         .checksum = checksum,
     };
-    try file.pwriteAll(std.mem.asBytes(&header), offset);
-    try file.pwriteAll(data, offset + HEADER_SIZE);
+    try file.writePositionalAll(std.testing.io, std.mem.asBytes(&header), offset);
+    try file.writePositionalAll(std.testing.io, data, offset + HEADER_SIZE);
     return offset + HEADER_SIZE + data.len;
 }
 
-fn writeValidRecord(file: std.fs.File, offset: u64, sequence: u64, data: []const u8) !u64 {
+fn writeValidRecord(file: Io.File, offset: u64, sequence: u64, data: []const u8) !u64 {
     return writeRawRecord(file, offset, sequence, data, std.hash.crc.Crc32.hash(data));
 }
 
 test "a torn tail of at most one batch is trimmed on open" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
 
     var valid_end: u64 = 0;
     {
-        const file = try tmp.dir.createFile("wal.bin", .{ .read = true });
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "wal.bin", .{ .read = true });
+        defer file.close(std.testing.io);
         var offset: u64 = 0;
         offset = try writeValidRecord(file, offset, 1, "one");
         offset = try writeValidRecord(file, offset, 2, "two");
@@ -1183,29 +1169,29 @@ test "a torn tail of at most one batch is trimmed on open" {
         _ = try writeValidRecord(file, later, 6, "six");
     }
 
-    var writer = try WalWriter.init(std.testing.allocator, dir, 4, 0, false);
+    var writer = try WalWriter.init(std.testing.io, std.testing.allocator, dir, 4, 0, false);
     defer writer.deinit();
 
     try std.testing.expectEqual(@as(u64, 3), writer.getSequence());
-    const trimmed = try tmp.dir.openFile("wal.bin", .{});
-    defer trimmed.close();
-    try std.testing.expectEqual(valid_end, try trimmed.getEndPos());
+    const trimmed = try tmp.dir.openFile(std.testing.io, "wal.bin", .{});
+    defer trimmed.close(std.testing.io);
+    try std.testing.expectEqual(valid_end, try trimmed.length(std.testing.io));
 }
 
 test "valid records more than a batch beyond a corrupt record refuse recovery with WalCorrupt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
 
     {
-        const file = try tmp.dir.createFile("wal.bin", .{ .read = true });
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "wal.bin", .{ .read = true });
+        defer file.close(std.testing.io);
         _ = try writeRawRecord(file, 0, 1, "corrupt", 0xDEADBEEF);
         var offset: u64 = BLOCK_SIZE;
         var sequence: u64 = 2;
         while (sequence <= 7) : (sequence += 1) offset = try writeValidRecord(file, offset, sequence, "later");
     }
 
-    try std.testing.expectError(error.WalCorrupt, WalWriter.init(std.testing.allocator, dir, 4, 0, false));
+    try std.testing.expectError(error.WalCorrupt, WalWriter.init(std.testing.io, std.testing.allocator, dir, 4, 0, false));
 }

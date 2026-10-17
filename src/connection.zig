@@ -1,5 +1,5 @@
 const std = @import("std");
-const posix = std.posix;
+const sys = @import("sys.zig");
 
 pub const Phase = enum(u8) {
     empty,
@@ -21,7 +21,7 @@ pub const BufferPair = struct {
 };
 
 pub const Connection = struct {
-    fd: posix.fd_t = -1,
+    fd: sys.fd_t = -1,
     phase: Phase = .empty,
     buf: ?*BufferPair = null,
     bytes_read: usize = 0,
@@ -56,7 +56,7 @@ pub const Connection = struct {
 
         const bp = self.buf orelse return error.NotOpenForWriting;
         const remaining = bp.response_buf[self.bytes_written..self.response_len];
-        const n = posix.write(self.fd, remaining) catch |err| switch (err) {
+        const n = sys.write(self.fd, remaining) catch |err| switch (err) {
             error.WouldBlock => return false,
             else => return err,
         };
@@ -72,7 +72,7 @@ test "Connection default state" {
     const conn = Connection{};
     try std.testing.expect(!conn.isActive());
     try std.testing.expectEqual(Phase.empty, conn.phase);
-    try std.testing.expectEqual(@as(posix.fd_t, -1), conn.fd);
+    try std.testing.expectEqual(@as(sys.fd_t, -1), conn.fd);
     try std.testing.expectEqual(@as(?*BufferPair, null), conn.buf);
 }
 
@@ -85,7 +85,7 @@ test "Connection reset" {
     conn.bytes_read = 100;
     conn.reset();
     try std.testing.expect(!conn.isActive());
-    try std.testing.expectEqual(@as(posix.fd_t, -1), conn.fd);
+    try std.testing.expectEqual(@as(sys.fd_t, -1), conn.fd);
     try std.testing.expectEqual(@as(usize, 0), conn.bytes_read);
     try std.testing.expectEqual(@as(?*BufferPair, null), conn.buf);
 }

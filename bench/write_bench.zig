@@ -143,8 +143,8 @@ fn shardLoad(allocator: std.mem.Allocator, keys: []const u64, shard_count: usize
     return counts;
 }
 
-fn runSetTrial(allocator: std.mem.Allocator, opts: Options, dir: []const u8, shard_count: usize, threads: usize, keys: []const u64) !TrialResult {
-    const set = try Set.init(allocator, .{
+fn runSetTrial(io: std.Io, allocator: std.mem.Allocator, opts: Options, dir: []const u8, shard_count: usize, threads: usize, keys: []const u64) !TrialResult {
+    const set = try Set.init(io, allocator, .{
         .data_dir = dir,
         .shard_count = shard_count,
         .cache_size_mb = opts.total_cache_mb,
@@ -170,10 +170,10 @@ fn runSetTrial(allocator: std.mem.Allocator, opts: Options, dir: []const u8, sha
         h.* = try std.Thread.spawn(.{}, SetWorker.run, .{&workers[i]});
     }
 
-    var timer = try std.time.Timer.start();
+    const started = std.Io.Clock.awake.now(io);
     start.store(true, .release);
     for (handles) |h| h.join();
-    const elapsed_ns = timer.read();
+    const elapsed_ns = started.untilNow(io, .awake).toNanoseconds();
 
     var errors: u64 = 0;
     for (workers) |w| errors += w.errors;
@@ -189,8 +189,8 @@ fn runSetTrial(allocator: std.mem.Allocator, opts: Options, dir: []const u8, sha
     };
 }
 
-fn runRawStoreTrial(allocator: std.mem.Allocator, opts: Options, dir: []const u8, threads: usize, keys: []const u64) !TrialResult {
-    const store = try Store.init(allocator, .{
+fn runRawStoreTrial(io: std.Io, allocator: std.mem.Allocator, opts: Options, dir: []const u8, threads: usize, keys: []const u64) !TrialResult {
+    const store = try Store.init(io, allocator, .{
         .data_dir = dir,
         .cache_size_mb = opts.total_cache_mb,
         .wal_batch_size = opts.wal_batch_size,
@@ -215,10 +215,10 @@ fn runRawStoreTrial(allocator: std.mem.Allocator, opts: Options, dir: []const u8
         h.* = try std.Thread.spawn(.{}, StoreWorker.run, .{&workers[i]});
     }
 
-    var timer = try std.time.Timer.start();
+    const started = std.Io.Clock.awake.now(io);
     start.store(true, .release);
     for (handles) |h| h.join();
-    const elapsed_ns = timer.read();
+    const elapsed_ns = started.untilNow(io, .awake).toNanoseconds();
 
     var errors: u64 = 0;
     for (workers) |w| errors += w.errors;
@@ -247,6 +247,7 @@ fn trialDir(buf: []u8, base: []const u8, tag: []const u8, shard_count: usize, tr
 }
 
 fn runSweep(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: Options,
     keys: []const u64,
@@ -268,9 +269,9 @@ fn runSweep(
 
         for (0..total) |trial| {
             const dir = try trialDir(&dir_buf, opts.dir, tag, sc, trial);
-            std.fs.cwd().deleteTree(dir) catch {};
-            const r = try runSetTrial(allocator, opts, dir, sc, threads, keys);
-            std.fs.cwd().deleteTree(dir) catch {};
+            std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+            const r = try runSetTrial(io, allocator, opts, dir, sc, threads, keys);
+            std.Io.Dir.cwd().deleteTree(io, dir) catch {};
             if (r.errors > 0) return error.BenchCommitErrors;
 
             if (trial >= opts.warmup) {
@@ -314,11 +315,12 @@ fn parseUsize(s: []const u8) !usize {
     return std.fmt.parseInt(usize, s, 10);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
+    const io = init.io;
 
     var opts = Options{};
-    var args = std.process.args();
+    var args = init.minimal.args.iterate();
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--ops")) {
@@ -346,8 +348,8 @@ pub fn main() !void {
 
     const cpus = std.Thread.getCpuCount() catch 1;
 
-    std.fs.cwd().makePath(opts.dir) catch {};
-    defer std.fs.cwd().deleteTree(opts.dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, opts.dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, opts.dir) catch {};
 
     const keys = try allocator.alloc(u64, opts.ops);
     defer allocator.free(keys);
@@ -392,10 +394,10 @@ pub fn main() !void {
         var direct_io = false;
         for (0..total) |trial| {
             const dir = try std.fmt.bufPrint(&dir_buf, "{s}/raw-t{d}", .{ opts.dir, trial });
-            std.fs.cwd().deleteTree(dir) catch {};
-            std.fs.cwd().makePath(dir) catch {};
-            const r = try runRawStoreTrial(allocator, opts, dir, opts.threads, keys);
-            std.fs.cwd().deleteTree(dir) catch {};
+            std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+            std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+            const r = try runRawStoreTrial(io, allocator, opts, dir, opts.threads, keys);
+            std.Io.Dir.cwd().deleteTree(io, dir) catch {};
             if (r.errors > 0) return error.BenchCommitErrors;
             if (trial >= opts.warmup) {
                 samples[measured] = r.ops_per_sec;
@@ -407,15 +409,15 @@ pub fn main() !void {
         std.debug.print("  raw Store     threads={d:<2}  median={d:>10.0} ops/s  mean={d:>10.0}  min={d:>10.0}  max={d:>10.0}  O_DIRECT={}\n", .{ opts.threads, stats.median, stats.mean, stats.min, stats.max, direct_io });
     }
 
-    var fixed = std.ArrayList(ConfigSummary){};
+    var fixed: std.ArrayList(ConfigSummary) = .empty;
     defer fixed.deinit(allocator);
     std.debug.print("\n--- sweep A: fixed offered load (threads={d} for every shard count) ---\n", .{opts.threads});
-    try runSweep(allocator, opts, keys, "fixed", fixedThreads, &fixed);
+    try runSweep(io, allocator, opts, keys, "fixed", fixedThreads, &fixed);
 
-    var scaled = std.ArrayList(ConfigSummary){};
+    var scaled: std.ArrayList(ConfigSummary) = .empty;
     defer scaled.deinit(allocator);
     std.debug.print("\n--- sweep B: fixed per-shard concurrency (threads = shard_count, 1 writer/shard) ---\n", .{});
-    try runSweep(allocator, opts, keys, "scaled", scaledThreads, &scaled);
+    try runSweep(io, allocator, opts, keys, "scaled", scaledThreads, &scaled);
 
     std.debug.print("\n=== speedup vs shards=1 (median ops/s; non-overlap = N-shard min exceeds 1-shard max) ===\n", .{});
     printSpeedup("sweep A (fixed load)", fixed.items);

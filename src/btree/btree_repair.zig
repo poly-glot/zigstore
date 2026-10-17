@@ -13,8 +13,8 @@ const slotsFromConstPage = btree.slotsFromConstPage;
 const isLeaf = btree.isLeaf;
 
 pub fn repairFromLeafChain(self: *BPlusTree, allocator: std.mem.Allocator) !RepairStats {
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
 
     var stats = RepairStats{
         .repaired = false,
@@ -39,9 +39,9 @@ pub fn repairFromLeafChain(self: *BPlusTree, allocator: std.mem.Allocator) !Repa
     const leftmost_leaf = try self.findLeaf("");
 
     const Entry = struct { key_off: u32, key_len: u16, pid: PageId };
-    var keys: std.ArrayListUnmanaged(u8) = .{};
+    var keys: std.ArrayList(u8) = .empty;
     defer keys.deinit(allocator);
-    var entries: std.ArrayListUnmanaged(Entry) = .{};
+    var entries: std.ArrayList(Entry) = .empty;
 
     const file_page_count = self.cache.page_count;
 
@@ -132,10 +132,10 @@ pub fn repairFromLeafChain(self: *BPlusTree, allocator: std.mem.Allocator) !Repa
         return stats;
     }
 
-    var current: std.ArrayListUnmanaged(Entry) = entries;
+    var current: std.ArrayList(Entry) = entries;
 
     while (current.items.len > 1) {
-        var next: std.ArrayListUnmanaged(Entry) = .{};
+        var next: std.ArrayList(Entry) = .empty;
         errdefer next.deinit(allocator);
 
         var i: usize = 0;
@@ -198,8 +198,8 @@ pub fn repairFromLeafChain(self: *BPlusTree, allocator: std.mem.Allocator) !Repa
 const page_cache = @import("../page_cache.zig");
 const freelist = @import("../freelist.zig");
 
-fn createTempFile(name: []const u8) !std.fs.File {
-    return std.fs.cwd().createFile(name, .{
+fn createTempFile(name: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(std.testing.io, name, .{
         .read = true,
         .truncate = true,
     });
@@ -208,14 +208,14 @@ fn createTempFile(name: []const u8) !std.fs.File {
 test "repairFromLeafChain rebuilds navigation over an artificially broken tree" {
     const path = "/tmp/test_btree_repair.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 256);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 256);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
 
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     const N: u32 = 600;
     var key_buf: [4]u8 = undefined;

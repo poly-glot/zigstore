@@ -1,6 +1,5 @@
 const std = @import("std");
-const posix = std.posix;
-const linux = std.os.linux;
+const sys = @import("sys.zig");
 const connection = @import("connection.zig");
 const signal = @import("signal.zig");
 const server_config = @import("server_config.zig");
@@ -17,16 +16,6 @@ pub const BUFFER_POOL_SIZE: u16 = 256;
 
 const CONNECTION_TIMEOUT_S: i64 = 30;
 
-/// The application-supplied protocol hooks the reactor drives per connection.
-///
-///   - `process_frames`: decode the connection's buffered request bytes and
-///     write framed responses, setting `conn.response_len`. The `ctx` is the
-///     opaque application context handed to the reactor at construction.
-///   - `header_size`: the minimum number of buffered bytes before a request
-///     frame's length is known; the reactor calls `process_frames` only once
-///     this many bytes have arrived.
-///   - `on_shutdown` (optional): invoked once with `ctx` when the primary
-///     reactor's event loop exits, for the application to flush durable state.
 /// The verdict for a parked connection whose response is staged but withheld pending durability.
 pub const ReleaseVerdict = enum {
     /// The gate is not yet satisfied — keep the connection parked.
@@ -68,13 +57,13 @@ pub const EpollServer = struct {
     ctx: *anyopaque,
     handler: Handler,
     config: ServerConfig,
-    epoll_fd: posix.fd_t,
-    listen_fd: posix.fd_t,
-    doorbell_fd: posix.fd_t,
+    epoll_fd: sys.fd_t,
+    listen_fd: sys.fd_t,
+    doorbell_fd: sys.fd_t,
     parked_count: u32 = 0,
     connections: [MAX_CONNECTIONS]connection.Connection,
 
-    fd_to_slot: std.AutoHashMap(posix.fd_t, u16),
+    fd_to_slot: std.AutoHashMap(sys.fd_t, u16),
 
     free_slot_stack: []u16,
     free_slot_count: u32,
@@ -84,7 +73,7 @@ pub const EpollServer = struct {
     free_count: u32,
     buf_pool_size: u32,
 
-    binary_write_fds: [MAX_CONNECTIONS]posix.fd_t = undefined,
+    binary_write_fds: [MAX_CONNECTIONS]sys.fd_t = undefined,
     binary_write_count: u32 = 0,
 
     const Self = @This();
@@ -106,48 +95,51 @@ pub const EpollServer = struct {
     }
 
     fn createOne(allocator: std.mem.Allocator, ctx: *anyopaque, handler: Handler, config: ServerConfig, register_shutdown: bool) !*Self {
-        const listen_fd = try posix.socket(
-            posix.AF.INET,
-            @as(u32, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC),
+        const listen_fd = try sys.socket(
+            sys.AF.INET,
+            @as(u32, sys.SOCK.STREAM | sys.SOCK.NONBLOCK | sys.SOCK.CLOEXEC),
             0,
         );
-        errdefer posix.close(listen_fd);
+        errdefer sys.close(listen_fd);
 
-        try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+        try sys.setsockopt(listen_fd, sys.SOL.SOCKET, sys.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try sys.setsockopt(listen_fd, sys.SOL.SOCKET, sys.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
 
-        const addr = std.net.Address.initIp4(config.bind_address, config.port);
-        try posix.bind(listen_fd, &addr.any, addr.getOsSockLen());
+        const addr = sys.sockaddr.in{
+            .port = std.mem.nativeToBig(u16, config.port),
+            .addr = @bitCast(config.bind_address),
+        };
+        try sys.bind(listen_fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in));
 
-        try posix.listen(listen_fd, 4096);
+        try sys.listen(listen_fd, 4096);
 
-        const epoll_fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
-        errdefer posix.close(epoll_fd);
+        const epoll_fd = try sys.epollCreate();
+        errdefer sys.close(epoll_fd);
 
-        var listen_event = linux.epoll_event{
-            .events = linux.EPOLL.IN,
+        var listen_event = sys.epoll_event{
+            .events = sys.EPOLL.IN,
             .data = .{ .fd = listen_fd },
         };
-        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listen_fd, &listen_event);
+        try sys.epollCtl(epoll_fd, sys.EPOLL.CTL_ADD, listen_fd, &listen_event);
 
         if (register_shutdown) {
             const shutdown_fd = signal.getShutdownPipeFd();
             if (shutdown_fd != -1) {
-                var shutdown_event = linux.epoll_event{
-                    .events = linux.EPOLL.IN,
+                var shutdown_event = sys.epoll_event{
+                    .events = sys.EPOLL.IN,
                     .data = .{ .fd = shutdown_fd },
                 };
-                try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, shutdown_fd, &shutdown_event);
+                try sys.epollCtl(epoll_fd, sys.EPOLL.CTL_ADD, shutdown_fd, &shutdown_event);
             }
         }
 
-        const doorbell_fd: posix.fd_t = @intCast(std.os.linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC));
-        errdefer posix.close(doorbell_fd);
-        var doorbell_event = linux.epoll_event{
-            .events = linux.EPOLL.IN,
+        const doorbell_fd = try sys.eventfd(sys.EFD.NONBLOCK | sys.EFD.CLOEXEC);
+        errdefer sys.close(doorbell_fd);
+        var doorbell_event = sys.epoll_event{
+            .events = sys.EPOLL.IN,
             .data = .{ .fd = doorbell_fd },
         };
-        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, doorbell_fd, &doorbell_event);
+        try sys.epollCtl(epoll_fd, sys.EPOLL.CTL_ADD, doorbell_fd, &doorbell_event);
 
         const buf_pool_size: u32 = @max(BUFFER_POOL_SIZE, config.thread_count * 64);
         const buffer_pairs = try allocator.alloc(connection.BufferPair, buf_pool_size);
@@ -172,7 +164,7 @@ pub const EpollServer = struct {
         server.buffer_pairs = buffer_pairs;
         server.free_stack = buf_free_stack;
         server.buf_pool_size = buf_pool_size;
-        server.fd_to_slot = std.AutoHashMap(posix.fd_t, u16).init(allocator);
+        server.fd_to_slot = std.AutoHashMap(sys.fd_t, u16).init(allocator);
         server.free_slot_stack = slot_stack;
         server.binary_write_count = 0;
 
@@ -206,15 +198,15 @@ pub const EpollServer = struct {
     pub fn destroy(self: *Self) void {
         for (&self.connections) |*c| {
             if (c.isActive() and c.fd != -1) {
-                posix.close(c.fd);
+                sys.close(c.fd);
                 if (c.buf) |bp| self.releaseBuffer(bp);
                 c.reset();
             }
         }
 
-        posix.close(self.epoll_fd);
-        posix.close(self.listen_fd);
-        posix.close(self.doorbell_fd);
+        sys.close(self.epoll_fd);
+        sys.close(self.listen_fd);
+        sys.close(self.doorbell_fd);
         signal.closeShutdownPipe();
 
         self.fd_to_slot.deinit();
@@ -228,14 +220,14 @@ pub const EpollServer = struct {
     /// Run the event loop until shutdown is signalled. On exit the primary
     /// reactor invokes the handler's `on_shutdown` hook, if any.
     pub fn run(self: *Self) !void {
-        var events: [MAX_EVENTS]linux.epoll_event = undefined;
+        var events: [MAX_EVENTS]sys.epoll_event = undefined;
         const shutdown_fd = signal.getShutdownPipeFd();
 
         log.info("Entering event loop", .{});
 
         while (!signal.shutdownRequested()) {
             const timeout_ms: i32 = if (self.parked_count > 0) PARKED_POLL_MS else 1000;
-            const n = posix.epoll_wait(self.epoll_fd, &events, timeout_ms);
+            const n = sys.epollWait(self.epoll_fd, &events, timeout_ms);
 
             self.binary_write_count = 0;
             var got_shutdown = false;
@@ -272,40 +264,40 @@ pub const EpollServer = struct {
 
     fn acceptConnection(self: *Self) void {
         while (true) {
-            var peer_addr: posix.sockaddr = undefined;
-            var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-            const client_fd = posix.accept(self.listen_fd, &peer_addr, &addr_len, @as(u32, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC)) catch |err| {
+            var peer_addr: sys.sockaddr = undefined;
+            var addr_len: sys.socklen_t = @sizeOf(sys.sockaddr);
+            const client_fd = sys.accept4(self.listen_fd, &peer_addr, &addr_len, @as(u32, sys.SOCK.NONBLOCK | sys.SOCK.CLOEXEC)) catch |err| {
                 if (err == error.WouldBlock) return;
                 log.warn("Accept failed: {}", .{err});
                 return;
             };
 
-            if (peer_addr.family != posix.AF.INET) {
+            if (peer_addr.family != sys.AF.INET) {
                 log.warn("Rejected connection: unexpected address family {d}", .{peer_addr.family});
-                posix.close(client_fd);
+                sys.close(client_fd);
                 continue;
             }
-            const in_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&peer_addr));
+            const in_addr: *const sys.sockaddr.in = @ptrCast(@alignCast(&peer_addr));
             const octets: [4]u8 = @bitCast(in_addr.addr);
             if (!self.config.isAllowed(octets)) {
                 log.warn("Protected mode: rejected connection from {d}.{d}.{d}.{d}", .{
                     octets[0], octets[1], octets[2], octets[3],
                 });
-                posix.close(client_fd);
+                sys.close(client_fd);
                 continue;
             }
 
             const free = self.findFreeSlot() orelse {
                 if (self.evictIdleConnection()) |_| {
                     const retry_free = self.findFreeSlot() orelse {
-                        posix.close(client_fd);
+                        sys.close(client_fd);
                         continue;
                     };
                     self.setupConnection(client_fd, retry_free.conn, retry_free.idx);
                     continue;
                 }
                 log.warn("No free connection slots, rejecting fd={d}", .{client_fd});
-                posix.close(client_fd);
+                sys.close(client_fd);
                 continue;
             };
 
@@ -313,12 +305,12 @@ pub const EpollServer = struct {
         }
     }
 
-    fn setupConnection(self: *Self, client_fd: posix.fd_t, slot: *connection.Connection, slot_idx: u16) void {
-        posix.setsockopt(client_fd, posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    fn setupConnection(self: *Self, client_fd: sys.fd_t, slot: *connection.Connection, slot_idx: u16) void {
+        sys.setsockopt(client_fd, sys.IPPROTO.TCP, sys.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
         const bp = self.acquireBuffer() orelse {
             log.warn("Buffer pool exhausted, rejecting fd={d} (pool={d})", .{ client_fd, self.buf_pool_size });
-            posix.close(client_fd);
+            sys.close(client_fd);
             return;
         };
 
@@ -326,47 +318,47 @@ pub const EpollServer = struct {
         slot.phase = .reading_request;
         slot.buf = bp;
         slot.bytes_read = 0;
-        slot.last_activity = std.time.timestamp();
+        slot.last_activity = sys.timestamp();
 
         self.fd_to_slot.put(client_fd, slot_idx) catch {
             log.warn("fd_to_slot map full for fd={d}", .{client_fd});
-            posix.close(client_fd);
+            sys.close(client_fd);
             self.releaseBuffer(bp);
             slot.reset();
             return;
         };
 
-        var ev = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.HUP | linux.EPOLL.ERR,
+        var ev = sys.epoll_event{
+            .events = sys.EPOLL.IN | sys.EPOLL.ET | sys.EPOLL.HUP | sys.EPOLL.ERR,
             .data = .{ .fd = client_fd },
         };
-        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev) catch {
+        sys.epollCtl(self.epoll_fd, sys.EPOLL.CTL_ADD, client_fd, &ev) catch {
             log.warn("epoll_ctl ADD failed for fd={d}", .{client_fd});
-            posix.close(client_fd);
+            sys.close(client_fd);
             _ = self.fd_to_slot.remove(client_fd);
             self.releaseBuffer(bp);
             slot.reset();
         };
     }
 
-    fn handleEvent(self: *Self, fd: posix.fd_t, events: u32) void {
+    fn handleEvent(self: *Self, fd: sys.fd_t, events: u32) void {
         const conn = self.findConnection(fd) orelse {
             if (self.fd_to_slot.contains(fd)) self.closeConnection(fd);
             return;
         };
 
-        if (events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
+        if (events & (sys.EPOLL.ERR | sys.EPOLL.HUP) != 0) {
             self.closeConnection(fd);
             return;
         }
 
-        if (events & linux.EPOLL.IN != 0 and conn.phase == .reading_request) {
-            conn.last_activity = std.time.timestamp();
+        if (events & sys.EPOLL.IN != 0 and conn.phase == .reading_request) {
+            conn.last_activity = sys.timestamp();
             if (self.drainAndProcess(fd, conn)) return;
             if (conn.response_len > 0) {
                 if (conn.gate_durable_seq != 0) {
                     conn.phase = .awaiting_durability;
-                    conn.parked_at_ms = std.time.milliTimestamp();
+                    conn.parked_at_ms = sys.milliTimestamp();
                     self.parked_count += 1;
                 } else {
                     conn.bytes_written = 0;
@@ -377,7 +369,7 @@ pub const EpollServer = struct {
             }
         }
 
-        if (events & linux.EPOLL.OUT != 0 and conn.phase == .writing_response) {
+        if (events & sys.EPOLL.OUT != 0 and conn.phase == .writing_response) {
             self.finishBinaryWrite(fd, conn);
         }
     }
@@ -394,7 +386,7 @@ pub const EpollServer = struct {
     fn drainDoorbell(self: *Self) void {
         var buf: [8]u8 = undefined;
         while (true) {
-            _ = posix.read(self.doorbell_fd, &buf) catch break;
+            _ = sys.read(self.doorbell_fd, &buf) catch break;
         }
     }
 
@@ -403,7 +395,7 @@ pub const EpollServer = struct {
     /// never blocks; a saturated counter simply coalesces).
     pub fn ringDoorbell(self: *Self) void {
         const one: u64 = 1;
-        _ = posix.write(self.doorbell_fd, std.mem.asBytes(&one)) catch {};
+        _ = sys.write(self.doorbell_fd, std.mem.asBytes(&one)) catch {};
     }
 
     /// Scans parked connections and releases (or fails) each whose gate the handler now clears.
@@ -412,7 +404,7 @@ pub const EpollServer = struct {
     fn releaseParked(self: *Self) void {
         const check = self.handler.release_check orelse return;
         const deadline = self.handler.parked_deadline_ms;
-        const now = if (deadline > 0) std.time.milliTimestamp() else 0;
+        const now = if (deadline > 0) sys.milliTimestamp() else 0;
         for (&self.connections) |*conn| {
             if (conn.phase != .awaiting_durability) continue;
             const fd = conn.fd;
@@ -438,7 +430,7 @@ pub const EpollServer = struct {
         }
     }
 
-    fn drainAndProcess(self: *Self, fd: posix.fd_t, conn: *connection.Connection) bool {
+    fn drainAndProcess(self: *Self, fd: sys.fd_t, conn: *connection.Connection) bool {
         const bp = conn.buf orelse {
             self.closeConnection(fd);
             return true;
@@ -446,7 +438,7 @@ pub const EpollServer = struct {
         while (true) {
             const remaining = bp.request_buf[conn.bytes_read..];
             if (remaining.len == 0) break;
-            const n = posix.read(fd, remaining) catch |err| {
+            const n = sys.read(fd, remaining) catch |err| {
                 if (err == error.WouldBlock) break;
                 self.closeConnection(fd);
                 return true;
@@ -471,7 +463,7 @@ pub const EpollServer = struct {
         return false;
     }
 
-    fn finishBinaryWrite(self: *Self, fd: posix.fd_t, conn: *connection.Connection) void {
+    fn finishBinaryWrite(self: *Self, fd: sys.fd_t, conn: *connection.Connection) void {
         while (true) {
             var done = false;
             while (!done) {
@@ -488,7 +480,7 @@ pub const EpollServer = struct {
             conn.bytes_written = 0;
             conn.response_len = 0;
             conn.phase = .reading_request;
-            conn.last_activity = std.time.timestamp();
+            conn.last_activity = sys.timestamp();
 
             if (self.drainAndProcess(fd, conn)) return;
             if (conn.response_len > 0) {
@@ -499,7 +491,7 @@ pub const EpollServer = struct {
                         conn.armed_for_write = false;
                     }
                     conn.phase = .awaiting_durability;
-                    conn.parked_at_ms = std.time.milliTimestamp();
+                    conn.parked_at_ms = sys.milliTimestamp();
                     self.parked_count += 1;
                     return;
                 }
@@ -516,8 +508,8 @@ pub const EpollServer = struct {
         }
     }
 
-    fn closeConnection(self: *Self, fd: posix.fd_t) void {
-        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
+    fn closeConnection(self: *Self, fd: sys.fd_t) void {
+        sys.epollCtl(self.epoll_fd, sys.EPOLL.CTL_DEL, fd, null) catch {};
 
         if (self.fd_to_slot.get(fd)) |slot_idx| {
             const conn = &self.connections[slot_idx];
@@ -528,32 +520,32 @@ pub const EpollServer = struct {
         }
 
         _ = self.fd_to_slot.remove(fd);
-        posix.close(fd);
+        sys.close(fd);
     }
 
     fn armForWrite(self: *Self, conn: *connection.Connection) void {
-        var ev = linux.epoll_event{
-            .events = linux.EPOLL.OUT | linux.EPOLL.ET | linux.EPOLL.HUP | linux.EPOLL.ERR,
+        var ev = sys.epoll_event{
+            .events = sys.EPOLL.OUT | sys.EPOLL.ET | sys.EPOLL.HUP | sys.EPOLL.ERR,
             .data = .{ .fd = conn.fd },
         };
         conn.armed_for_write = true;
-        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
+        sys.epollCtl(self.epoll_fd, sys.EPOLL.CTL_MOD, conn.fd, &ev) catch {
             self.closeConnection(conn.fd);
         };
     }
 
     fn armForRead(self: *Self, conn: *connection.Connection) void {
-        var ev = linux.epoll_event{
-            .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.HUP | linux.EPOLL.ERR,
+        var ev = sys.epoll_event{
+            .events = sys.EPOLL.IN | sys.EPOLL.ET | sys.EPOLL.HUP | sys.EPOLL.ERR,
             .data = .{ .fd = conn.fd },
         };
-        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
+        sys.epollCtl(self.epoll_fd, sys.EPOLL.CTL_MOD, conn.fd, &ev) catch {
             self.closeConnection(conn.fd);
         };
     }
 
     fn sweepIdleConnections(self: *Self) void {
-        const now = std.time.timestamp();
+        const now = sys.timestamp();
         for (&self.connections) |*c| {
             if (!c.isActive() or c.fd == -1) continue;
             if (c.phase != .reading_request) continue;
@@ -565,7 +557,7 @@ pub const EpollServer = struct {
 
     fn evictIdleConnection(self: *Self) ?u16 {
         var oldest_time: i64 = std.math.maxInt(i64);
-        var oldest_fd: posix.fd_t = -1;
+        var oldest_fd: sys.fd_t = -1;
 
         for (&self.connections) |*c| {
             if (c.phase == .reading_request and c.last_activity < oldest_time) {
@@ -582,7 +574,7 @@ pub const EpollServer = struct {
         return null;
     }
 
-    fn findConnection(self: *Self, fd: posix.fd_t) ?*connection.Connection {
+    fn findConnection(self: *Self, fd: sys.fd_t) ?*connection.Connection {
         const slot_idx = self.fd_to_slot.get(fd) orelse return null;
         const conn = &self.connections[slot_idx];
         if (conn.isActive()) return conn;
@@ -653,7 +645,7 @@ fn parkTestServer(handler: Handler) !*EpollServer {
     return EpollServer.create(std.testing.allocator, &ctx, handler, .{ .port = 0, .thread_count = 2 });
 }
 
-fn injectParkedConn(server: *EpollServer, fd: posix.fd_t) void {
+fn injectParkedConn(server: *EpollServer, fd: sys.fd_t) void {
     const free = server.findFreeSlot().?;
     const bp = server.acquireBuffer().?;
     free.conn.fd = fd;
@@ -665,6 +657,10 @@ fn injectParkedConn(server: *EpollServer, fd: posix.fd_t) void {
     server.parked_count += 1;
 }
 
+fn unixSocket() !sys.fd_t {
+    return sys.socket(sys.AF.UNIX, sys.SOCK.STREAM, 0);
+}
+
 test "releaseParked .fail un-parks exactly once — no parked_count double-decrement" {
     const server = try parkTestServer(.{
         .process_frames = ParkTestHandler.processFrames,
@@ -673,7 +669,7 @@ test "releaseParked .fail un-parks exactly once — no parked_count double-decre
     });
     defer server.destroy();
 
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fd = try unixSocket();
     injectParkedConn(server, fd);
     try std.testing.expectEqual(@as(u32, 1), server.parked_count);
 
@@ -692,18 +688,18 @@ test "releaseParked deadline-fail un-parks exactly once" {
     });
     defer server.destroy();
 
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fd = try unixSocket();
     injectParkedConn(server, fd);
     const slot = server.fd_to_slot.get(fd).?;
-    server.connections[slot].parked_at_ms = std.time.milliTimestamp() - 1000;
+    server.connections[slot].parked_at_ms = sys.milliTimestamp() - 1000;
 
     server.releaseParked();
 
     try std.testing.expectEqual(@as(u32, 0), server.parked_count);
 }
 
-fn fdIsOpen(fd: posix.fd_t) bool {
-    return posix.errno(linux.fcntl(fd, posix.F.GETFD, 0)) == .SUCCESS;
+fn fdIsOpen(fd: sys.fd_t) bool {
+    return std.os.linux.errno(std.os.linux.fcntl(fd, std.os.linux.F.GETFD, 0)) == .SUCCESS;
 }
 
 fn plainTestServer() !*EpollServer {
@@ -717,10 +713,10 @@ test "handleEvent leaves an fd the reactor does not own untouched" {
     const server = try plainTestServer();
     defer server.destroy();
 
-    const unowned = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer posix.close(unowned);
+    const unowned = try unixSocket();
+    defer sys.close(unowned);
 
-    server.handleEvent(unowned, linux.EPOLL.IN);
+    server.handleEvent(unowned, sys.EPOLL.IN);
 
     try std.testing.expect(fdIsOpen(unowned));
     try std.testing.expect(!server.fd_to_slot.contains(unowned));
@@ -730,22 +726,22 @@ test "handleEvent on a stale event for an already-closed fd does not abort the r
     const server = try plainTestServer();
     defer server.destroy();
 
-    const recycled = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    posix.close(recycled);
+    const recycled = try unixSocket();
+    sys.close(recycled);
 
-    server.handleEvent(recycled, linux.EPOLL.IN);
+    server.handleEvent(recycled, sys.EPOLL.IN);
 }
 
 test "handleEvent still reaps an owned slot whose connection went inactive" {
     const server = try plainTestServer();
     defer server.destroy();
 
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fd = try unixSocket();
     const free = server.findFreeSlot().?;
     free.conn.phase = .empty;
     try server.fd_to_slot.put(fd, free.idx);
 
-    server.handleEvent(fd, linux.EPOLL.IN);
+    server.handleEvent(fd, sys.EPOLL.IN);
 
     try std.testing.expect(!server.fd_to_slot.contains(fd));
     try std.testing.expect(!fdIsOpen(fd));

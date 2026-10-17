@@ -12,8 +12,8 @@ const slotsFromConstPage = btree.slotsFromConstPage;
 const slotsFromPage = btree.slotsFromPage;
 
 pub fn delete(self: *BPlusTree, key: []const u8) !bool {
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
 
     if (self.root_page == INVALID_PAGE) return false;
 
@@ -107,8 +107,8 @@ fn removeEmptyLeaf(self: *BPlusTree, leaf_id: PageId, path: *PathStack) !void {
 const page_cache = @import("../page_cache.zig");
 const freelist = @import("../freelist.zig");
 
-fn createTempFile(name: []const u8) !std.fs.File {
-    return std.fs.cwd().createFile(name, .{
+fn createTempFile(name: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(std.testing.io, name, .{
         .read = true,
         .truncate = true,
     });
@@ -117,14 +117,14 @@ fn createTempFile(name: []const u8) !std.fs.File {
 test "delete" {
     const path = "/tmp/test_btree_delete.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 64);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
 
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     try tree.insert("alpha", "1");
     try tree.insert("beta", "2");
@@ -147,14 +147,14 @@ test "delete" {
 test "entry_count tracks insert/delete/duplicate" {
     const path = "/tmp/test_btree_entry_count.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 64);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
 
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     try std.testing.expectEqual(@as(u64, 0), tree.entry_count);
 
@@ -180,13 +180,13 @@ test "entry_count tracks insert/delete/duplicate" {
 test "H3: deleting the cached rightmost leaf invalidates the cache" {
     const path = "/tmp/test_btree_h3_rightmost.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 256);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 256);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     var i: u64 = 0;
     while (i < 2000) : (i += 1) {
@@ -208,13 +208,13 @@ test "H3: deleting the cached rightmost leaf invalidates the cache" {
 test "H4: leaf chain stays scannable across delete + reuse churn" {
     const path = "/tmp/test_btree_h4_chain.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 512);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 512);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     var i: u64 = 0;
     while (i < 3000) : (i += 1) {
@@ -235,7 +235,7 @@ test "H4: leaf chain stays scannable across delete + reuse churn" {
         try tree.insert(&k, &k);
     }
 
-    const min_key: [8]u8 = .{0} ** 8;
+    const min_key: [8]u8 = @splat(0);
     var iter = try tree.rangeScan(&min_key, null);
     defer iter.deinit();
     var expect: u64 = 1500;

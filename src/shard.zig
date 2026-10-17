@@ -28,6 +28,7 @@
 //!     replication/snapshots.
 
 const std = @import("std");
+const Io = std.Io;
 const engine = @import("engine.zig");
 const commitOne = @import("commit.zig").commit;
 
@@ -86,23 +87,24 @@ pub fn ShardSet(comptime Store: type) type {
             bootstrap: *const fn (ctx: *anyopaque) anyerror!void,
         };
 
+        io: Io,
         allocator: std.mem.Allocator,
         /// The shard stores, indexed `0..shard_count`. Reach an individual `*Store` here to run a
         /// single-shard range scan or to wire per-shard replication/snapshots.
         shards: []*Store,
         shard_paths: [][]u8,
 
-        /// Open (or create) the shard set under `config.data_dir`. Creates the parent directory
+        /// Open (or create) the shard set under `config.data_dir` on `io`. Creates the parent directory
         /// and a `shard-<i>` subdirectory per shard, opens a `Store` in each with an even split of
         /// the total cache budget, and records (or validates) `shard_count` in `shardset.meta`.
         /// Fails with `error.ShardCountMismatch`/`error.ShardHashMismatch` on a topology change,
         /// and tears down any shards already opened on a mid-fan-out failure. Returns a
         /// heap-allocated `*Self` at a stable address; release it with `deinit`.
-        pub fn init(allocator: std.mem.Allocator, config: Config) !*Self {
+        pub fn init(io: Io, allocator: std.mem.Allocator, config: Config) !*Self {
             if (config.shard_count == 0) return error.InvalidShardCount;
 
-            try std.fs.cwd().makePath(config.data_dir);
-            try reconcileMeta(allocator, config.data_dir, config.shard_count);
+            try Io.Dir.cwd().createDirPath(io, config.data_dir);
+            try reconcileMeta(io, allocator, config.data_dir, config.shard_count);
 
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
@@ -127,7 +129,7 @@ pub fn ShardSet(comptime Store: type) type {
             for (0..config.shard_count) |i| {
                 const path = try std.fmt.allocPrint(allocator, "{s}/shard-{d}", .{ config.data_dir, i });
                 shard_paths[i] = path;
-                shards[i] = Store.init(allocator, .{
+                shards[i] = Store.init(io, allocator, .{
                     .data_dir = path,
                     .cache_size_mb = per_shard_cache,
                     .wal_batch_size = config.wal_batch_size,
@@ -140,6 +142,7 @@ pub fn ShardSet(comptime Store: type) type {
             }
 
             self.* = .{
+                .io = io,
                 .allocator = allocator,
                 .shards = shards,
                 .shard_paths = shard_paths,
@@ -256,11 +259,11 @@ pub fn ShardSet(comptime Store: type) type {
             return total;
         }
 
-        fn reconcileMeta(allocator: std.mem.Allocator, data_dir: []const u8, shard_count: usize) !void {
-            const path = try std.fs.path.join(allocator, &.{ data_dir, "shardset.meta" });
+        fn reconcileMeta(io: Io, allocator: std.mem.Allocator, data_dir: []const u8, shard_count: usize) !void {
+            const path = try Io.Dir.path.join(allocator, &.{ data_dir, "shardset.meta" });
             defer allocator.free(path);
 
-            const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+            const file = Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
                 error.FileNotFound => {
                     const meta = Meta{
                         .magic = META_MAGIC,
@@ -268,18 +271,18 @@ pub fn ShardSet(comptime Store: type) type {
                         .shard_count = shard_count,
                         .routing_hash = ROUTING_HASH_WYHASH_V0,
                     };
-                    const created = try std.fs.cwd().createFile(path, .{});
-                    defer created.close();
-                    try created.writeAll(std.mem.asBytes(&meta));
-                    try created.sync();
+                    const created = try Io.Dir.cwd().createFile(io, path, .{});
+                    defer created.close(io);
+                    try created.writePositionalAll(io, std.mem.asBytes(&meta), 0);
+                    try created.sync(io);
                     return;
                 },
                 else => return err,
             };
-            defer file.close();
+            defer file.close(io);
 
             var buf: [@sizeOf(Meta)]u8 = undefined;
-            const n = try file.readAll(&buf);
+            const n = try file.readPositionalAll(io, &buf, 0);
             if (n < @sizeOf(Meta)) return error.ShardSetMetaCorrupt;
 
             const meta = std.mem.bytesToValue(Meta, &buf);
@@ -323,7 +326,7 @@ fn applyTestRecord(ctx: *anyopaque, rec: TestRecord) anyerror!void {
 }
 
 fn openTestSet(allocator: std.mem.Allocator, dir: []const u8, shard_count: usize) !*TestSet {
-    return TestSet.init(allocator, .{ .data_dir = dir, .shard_count = shard_count, .cache_size_mb = 16 });
+    return TestSet.init(std.testing.io, allocator, .{ .data_dir = dir, .shard_count = shard_count, .cache_size_mb = 16 });
 }
 
 fn commitTestKey(set: *TestSet, key: u64) !void {
@@ -335,7 +338,7 @@ test "shardIndexFor is deterministic and within range" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     const set = try openTestSet(allocator, dir, 4);
@@ -355,7 +358,7 @@ test "a committed key is stored in exactly the shard it routes to" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     const shard_count = 4;
@@ -385,7 +388,7 @@ test "reopen with the same shard_count preserves the partitioning and finds ever
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     {
@@ -414,7 +417,7 @@ test "reopen with a different shard_count fails rather than re-routing keys" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     {
@@ -438,7 +441,7 @@ test "init creates a not-yet-existing nested parent directory" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
 
     const nested = try std.fmt.allocPrint(allocator, "{s}/a/b/c", .{root});
@@ -457,7 +460,7 @@ test "shard_count = 1 routes every key to the sole shard" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     const set = try openTestSet(allocator, dir, 1);
@@ -476,14 +479,14 @@ test "init partial failure tears down opened shards without leaking" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     var saw_failure = false;
     var fail_index: usize = 0;
     while (fail_index < 256) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
-        const set = TestSet.init(failing.allocator(), .{ .data_dir = dir, .shard_count = 4, .cache_size_mb = 16 }) catch {
+        const set = TestSet.init(std.testing.io, failing.allocator(), .{ .data_dir = dir, .shard_count = 4, .cache_size_mb = 16 }) catch {
             saw_failure = true;
             continue;
         };
@@ -497,7 +500,7 @@ test "recoverAll runs every shard and bootstraps each empty shard once" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     const set = try openTestSet(allocator, dir, 3);
@@ -537,7 +540,7 @@ test "healthStatus reduces read_only across shards with OR" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     const set = try openTestSet(allocator, dir, 3);
@@ -565,7 +568,7 @@ test "concurrent commits across shards all land and stay findable" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir);
 
     const set = try openTestSet(allocator, dir, 4);

@@ -84,11 +84,12 @@ pub const KV = struct {
 };
 
 pub const RangeScanIterator = struct {
+    io: std.Io,
     cache: *page_cache.PageCache,
     current_page: PageId,
     current_slot: u32,
     end_key: ?[]const u8,
-    lock: ?*std.Thread.RwLock = null,
+    lock: ?*std.Io.RwLock = null,
 
     key_buf: [256]u8 = undefined,
     val_buf: [page.PAGE_SIZE]u8 = undefined,
@@ -99,7 +100,7 @@ pub const RangeScanIterator = struct {
     /// Every `rangeScan` caller must `defer iter.deinit()`.
     pub fn deinit(self: *RangeScanIterator) void {
         if (self.lock) |l| {
-            l.unlockShared();
+            l.unlockShared(self.io);
             self.lock = null;
         }
     }
@@ -161,10 +162,11 @@ pub const RepairStats = struct {
 };
 
 pub const BPlusTree = struct {
+    io: std.Io,
     cache: *page_cache.PageCache,
     free_list: *freelist.FreeList,
     root_page: PageId,
-    lock: std.Thread.RwLock,
+    lock: std.Io.RwLock,
 
     cached_rightmost_leaf: PageId = INVALID_PAGE,
     cached_rightmost_path: PathStack = .{},

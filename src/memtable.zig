@@ -5,6 +5,7 @@ const log = std.log.scoped(.memtable);
 pub const NUM_SHARDS = 32;
 
 pub const MemTable = struct {
+    io: std.Io,
     shards: [NUM_SHARDS]Shard,
     allocator: std.mem.Allocator,
 
@@ -44,19 +45,19 @@ pub const MemTable = struct {
     const Shard = struct {
         front: Buffer,
         back: Buffer,
-        lock: std.Thread.Mutex,
+        lock: std.Io.Mutex,
     };
 
-    pub fn init(allocator: std.mem.Allocator) MemTable {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator) MemTable {
         var shards: [NUM_SHARDS]Shard = undefined;
         for (&shards) |*s| {
             s.* = .{
                 .front = Buffer.init(allocator),
                 .back = Buffer.init(allocator),
-                .lock = .{},
+                .lock = .init,
             };
         }
-        return .{ .shards = shards, .allocator = allocator };
+        return .{ .io = io, .shards = shards, .allocator = allocator };
     }
 
     pub fn deinit(self: *MemTable) void {
@@ -68,29 +69,29 @@ pub const MemTable = struct {
 
     pub fn put(self: *MemTable, key: []const u8, value: []const u8) !void {
         const shard = self.getShard(key);
-        shard.lock.lock();
-        defer shard.lock.unlock();
+        shard.lock.lockUncancelable(self.io);
+        defer shard.lock.unlock(self.io);
         try putInto(&shard.front, key, value, false);
     }
 
     pub fn delete(self: *MemTable, key: []const u8) !void {
         const shard = self.getShard(key);
-        shard.lock.lock();
-        defer shard.lock.unlock();
+        shard.lock.lockUncancelable(self.io);
+        defer shard.lock.unlock(self.io);
         try putInto(&shard.front, key, &.{}, true);
     }
 
     pub fn get(self: *MemTable, key: []const u8) GetResult {
         const shard = self.getShard(key);
-        shard.lock.lock();
-        defer shard.lock.unlock();
+        shard.lock.lockUncancelable(self.io);
+        defer shard.lock.unlock(self.io);
         return getFromShard(shard, key);
     }
 
     pub fn putIfAbsent(self: *MemTable, key: []const u8, value: []const u8) !bool {
         const shard = self.getShard(key);
-        shard.lock.lock();
-        defer shard.lock.unlock();
+        shard.lock.lockUncancelable(self.io);
+        defer shard.lock.unlock(self.io);
         const result = getFromShard(shard, key);
         switch (result) {
             .found => return false,
@@ -104,19 +105,19 @@ pub const MemTable = struct {
     pub fn count(self: *MemTable) u32 {
         var total: u32 = 0;
         for (&self.shards) |*s| {
-            s.lock.lock();
+            s.lock.lockUncancelable(self.io);
             total += s.front.map.count();
-            s.lock.unlock();
+            s.lock.unlock(self.io);
         }
         return total;
     }
 
     pub fn lockAll(self: *MemTable) void {
-        for (&self.shards) |*s| s.lock.lock();
+        for (&self.shards) |*s| s.lock.lockUncancelable(self.io);
     }
 
     pub fn unlockAll(self: *MemTable) void {
-        for (&self.shards) |*s| s.lock.unlock();
+        for (&self.shards) |*s| s.lock.unlock(self.io);
     }
 
     pub fn swapShardLocked(self: *MemTable, i: usize) !*Buffer {
@@ -172,7 +173,7 @@ pub const MemTable = struct {
 };
 
 test "MemTable put and get" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     try mt.put("key1", "value1");
@@ -188,7 +189,7 @@ test "MemTable put and get" {
 }
 
 test "MemTable overwrite" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     try mt.put("key", "v1");
@@ -197,7 +198,7 @@ test "MemTable overwrite" {
 }
 
 test "MemTable delete (tombstone)" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     try mt.put("key", "value");
@@ -206,7 +207,7 @@ test "MemTable delete (tombstone)" {
 }
 
 test "MemTable putIfAbsent" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     const inserted = try mt.putIfAbsent("key", "value1");
@@ -219,7 +220,7 @@ test "MemTable putIfAbsent" {
 }
 
 test "MemTable swap and drain" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     try mt.put("a", "1");
@@ -243,7 +244,7 @@ test "MemTable swap and drain" {
 }
 
 test "MemTable concurrent writers" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     const Writer = struct {
@@ -268,7 +269,7 @@ test "MemTable concurrent writers" {
 }
 
 test "a row a drain swapped into the back buffer stays visible until the drain resets it" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     try mt.put("swapped", "value");
@@ -287,7 +288,7 @@ test "a row a drain swapped into the back buffer stays visible until the drain r
 }
 
 test "a tombstone written during a drain shadows the swapped-out value" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     try mt.put("k", "old");
@@ -303,7 +304,7 @@ test "a tombstone written during a drain shadows the swapped-out value" {
 }
 
 test "a drain that fails midway keeps the newest value visible and the retry drains it" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = MemTable.init(std.testing.io, std.testing.allocator);
     defer mt.deinit();
 
     try mt.put("k", "v1");

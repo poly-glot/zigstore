@@ -19,8 +19,8 @@ const slotsFromPage = btree.slotsFromPage;
 const isLeaf = btree.isLeaf;
 
 pub fn insert(self: *BPlusTree, key: []const u8, value: []const u8) !void {
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
 
     if (try tryRightmostInsert(self, key, value)) {
         self.entry_count += 1;
@@ -487,8 +487,8 @@ fn compactAndInsert(self: *BPlusTree, leaf_id: PageId, key: []const u8, value: [
 const page_cache = @import("../page_cache.zig");
 const freelist = @import("../freelist.zig");
 
-fn createTempFile(name: []const u8) !std.fs.File {
-    return std.fs.cwd().createFile(name, .{
+fn createTempFile(name: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(std.testing.io, name, .{
         .read = true,
         .truncate = true,
     });
@@ -497,14 +497,14 @@ fn createTempFile(name: []const u8) !std.fs.File {
 test "sequential inserts cause splits" {
     const path = "/tmp/test_btree_splits.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 64);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
 
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     var buf: [32]u8 = undefined;
     const count: usize = 200;
@@ -525,21 +525,21 @@ test "sequential inserts cause splits" {
 test "stress: phase-9 shape — iter one tree while inserting into another (shared cache)" {
     const path = "/tmp/test_btree_stress_phase9.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 1024);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 1024);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
 
     const journal_path = "/tmp/test_btree_stress_phase9.journal";
     const journal = try createTempFile(journal_path);
-    defer journal.close();
-    defer std.fs.cwd().deleteFile(journal_path) catch {};
-    const header_page = [_]u8{0} ** page.PAGE_SIZE;
+    defer journal.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, journal_path) catch {};
+    const header_page: [page.PAGE_SIZE]u8 = @splat(0);
 
-    var existing_tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
-    var slug_tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var existing_tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
+    var slug_tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     const N: u32 = 150_000;
 
@@ -596,13 +596,13 @@ test "stress: phase-9 shape — iter one tree while inserting into another (shar
 test "stress: 150k inserts of variable-length slug-path-shaped keys" {
     const path = "/tmp/test_btree_stress_slug.db";
     const file = try createTempFile(path);
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    defer file.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 1024);
+    var cache = try page_cache.PageCache.init(std.testing.io, std.testing.allocator, file, 1024);
     defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, INVALID_PAGE);
-    var tree = BPlusTree.init(&cache, &fl, INVALID_PAGE);
+    var fl = freelist.FreeList.init(std.testing.io, &cache, INVALID_PAGE);
+    var tree = BPlusTree.init(std.testing.io, &cache, &fl, INVALID_PAGE);
 
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
     const r = prng.random();

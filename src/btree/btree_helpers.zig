@@ -15,12 +15,13 @@ const compareKeys = btree.compareKeys;
 const slotsFromConstPage = btree.slotsFromConstPage;
 const isInternal = btree.isInternal;
 
-pub fn init(cache: *page_cache.PageCache, fl: *freelist.FreeList, root_page: PageId) BPlusTree {
+pub fn init(io: std.Io, cache: *page_cache.PageCache, fl: *freelist.FreeList, root_page: PageId) BPlusTree {
     return BPlusTree{
+        .io = io,
         .cache = cache,
         .free_list = fl,
         .root_page = root_page,
-        .lock = .{},
+        .lock = .init,
     };
 }
 
@@ -29,14 +30,14 @@ pub fn getRootPage(self: *const BPlusTree) PageId {
 }
 
 pub fn entryCount(self: *BPlusTree) u64 {
-    self.lock.lockShared();
-    defer self.lock.unlockShared();
+    self.lock.lockSharedUncancelable(self.io);
+    defer self.lock.unlockShared(self.io);
     return self.entry_count;
 }
 
 pub fn truncate(self: *BPlusTree, allocator: std.mem.Allocator) !void {
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
 
     if (self.root_page != INVALID_PAGE) {
         try freeSubtree(self, allocator, self.root_page);
@@ -59,7 +60,7 @@ pub fn freeSubtree(self: *BPlusTree, allocator: std.mem.Allocator, page_id: Page
     const pg = try self.cache.getPage(page_id);
     const internal = isInternal(pg);
 
-    var children: std.ArrayList(PageId) = .{};
+    var children: std.ArrayList(PageId) = .empty;
     defer children.deinit(allocator);
 
     if (internal) {
@@ -81,11 +82,12 @@ pub fn freeSubtree(self: *BPlusTree, allocator: std.mem.Allocator, page_id: Page
 }
 
 pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) !RangeScanIterator {
-    self.lock.lockShared();
-    errdefer self.lock.unlockShared();
+    self.lock.lockSharedUncancelable(self.io);
+    errdefer self.lock.unlockShared(self.io);
 
     if (self.root_page == INVALID_PAGE) {
         return RangeScanIterator{
+            .io = self.io,
             .cache = self.cache,
             .current_page = INVALID_PAGE,
             .current_slot = 0,
@@ -112,6 +114,7 @@ pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) 
     self.cache.unpinPage(leaf_id);
 
     return RangeScanIterator{
+        .io = self.io,
         .cache = self.cache,
         .current_page = leaf_id,
         .current_slot = start_slot,
