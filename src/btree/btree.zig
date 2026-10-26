@@ -91,7 +91,7 @@ pub const RangeScanIterator = struct {
     end_key: ?[]const u8,
     lock: ?*std.Io.RwLock = null,
 
-    key_buf: [256]u8 = undefined,
+    key_buf: [page.PAGE_SIZE]u8 = undefined,
     val_buf: [page.PAGE_SIZE]u8 = undefined,
     key_len: u32 = 0,
     val_len: u32 = 0,

@@ -1618,6 +1618,29 @@ test "recover truncates the WAL after its post-replay checkpoint" {
     try expectKeyPresent(store, 5, true);
 }
 
+test "range scan returns a key longer than 256 bytes intact because insert accepts any key up to BODY_SIZE" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store = try openTestStore(allocator, &tmp);
+    defer closeTestStore(store);
+
+    var long_key: [406]u8 = undefined;
+    @memset(&long_key, 'k');
+    try store.tree("by_slug").insert("a", "short");
+    try store.tree("by_slug").insert(&long_key, "long");
+
+    var iter = try store.tree("by_slug").rangeScan("a", null);
+    defer iter.deinit();
+    const first = (try iter.next()).?;
+    try std.testing.expectEqualSlices(u8, "a", first.key);
+    const second = (try iter.next()).?;
+    try std.testing.expectEqualSlices(u8, &long_key, second.key);
+    try std.testing.expectEqualSlices(u8, "long", second.value);
+    try std.testing.expectEqual(@as(?@TypeOf(first), null), try iter.next());
+}
+
 test "a drain that fails midway keeps the newest value visible and the retry drains it" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
